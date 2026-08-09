@@ -70,8 +70,8 @@ provides a nearby same-Wi-Fi status endpoint on port `8765`; its setup-only test
 src/
   components/   Layout, BottomNav, Card, Button, StatusPulse (signature live-sensing indicator)
   context/      DeviceContext (paired device + Realtime status/events)
-  lib/          supabaseClient.js, format.js (labels/timestamps)
-  pages/        Pairing, Dashboard, History, Settings, Diagnostics
+  lib/          supabaseClient.js, format.js (labels/timestamps), demoData.js (demo-mode sample data)
+  pages/        Pairing, WifiSetup, Dashboard, History, Settings, Diagnostics
 supabase/
   schema.sql    Full database schema + RLS policies
 ```

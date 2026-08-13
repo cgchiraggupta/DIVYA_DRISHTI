@@ -4,6 +4,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
+User=root
 ExecStart=/usr/bin/python3 /home/pi/divyadrishti_control_button.py
 Restart=on-failure
 RestartSec=2

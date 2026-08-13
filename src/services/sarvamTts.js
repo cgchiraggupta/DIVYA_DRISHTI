@@ -56,24 +56,37 @@ function playBase64Wav(base64, volume = 1) {
 /**
  * Speak text with Sarvam. Returns true if audio played, false if skipped/failed.
  */
-export async function speakWithSarvam(text, { volume = 1, language = DEFAULT_LANG, speaker = DEFAULT_SPEAKER } = {}) {
+export async function speakWithSarvam(
+  text,
+  { volume = 1, language = DEFAULT_LANG, speaker = DEFAULT_SPEAKER, timeoutMs = 6_000 } = {},
+) {
   const key = apiKey()
   if (!key || !text?.trim()) return false
 
-  const response = await fetch(SARVAM_URL, {
-    method: 'POST',
-    headers: {
-      'api-subscription-key': key,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      text: text.trim().slice(0, 2500),
-      target_language_code: language,
-      speaker,
-      model: 'bulbul:v3',
-      pace: 0.95,
-    }),
-  })
+  // Without this the request can hang forever on a flaky network and block
+  // every later alert, which is why the phone went silent during walks.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let response
+  try {
+    response = await fetch(SARVAM_URL, {
+      method: 'POST',
+      headers: {
+        'api-subscription-key': key,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: text.trim().slice(0, 2500),
+        target_language_code: language,
+        speaker,
+        model: 'bulbul:v3',
+        pace: 0.95,
+      }),
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timer)
+  }
 
   if (!response.ok) {
     const detail = await response.text().catch(() => '')

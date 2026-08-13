@@ -4,6 +4,7 @@ import { createDemoEvent, demoDevice, demoEvents, demoStatus, sceneSpeakText } f
 import { signalGuidance, speakGuidance } from '../services/sensoryFeedback'
 import { getNearbyDeviceStatus, sendNearbyCommand, sendNearbyDescribe, clearNearbyDeviceUrlCache } from '../services/localDeviceLink'
 import { loadObstacleHistory, saveObstacleHistoryItem } from '../services/obstacleHistory'
+import { startBackgroundGuardian, stopBackgroundGuardian } from '../services/backgroundGuardian'
 
 const DeviceContext = createContext(undefined)
 const PAIRING_CODE_KEY = 'divya-drishti-pairing-code'
@@ -19,6 +20,28 @@ export function DeviceProvider({ children }) {
   const [lastRefreshedAt, setLastRefreshedAt] = useState(null)
   const [obstacleHistory, setObstacleHistory] = useState(() => loadObstacleHistory())
   const speakingAlertRef = useRef(false)
+
+  /**
+   * Speak one alert on this phone. A stuck TTS call must never latch the guard,
+   * or every later obstacle goes silent for the rest of the walk.
+   */
+  const speakAlertOnce = useCallback(async (text) => {
+    if (!text || speakingAlertRef.current) return
+    speakingAlertRef.current = true
+    const release = window.setTimeout(() => {
+      speakingAlertRef.current = false
+    }, 10_000)
+    try {
+      console.log('[tts] speaking alert:', text)
+      await speakGuidance(text, 1, { fast: true })
+      console.log('[tts] alert spoken')
+    } catch (error) {
+      console.warn('[tts] alert failed', error)
+    } finally {
+      window.clearTimeout(release)
+      speakingAlertRef.current = false
+    }
+  }, [])
 
   const loadDevice = useCallback(async ({ background = false } = {}) => {
     if (isDemoMode) {
@@ -149,6 +172,9 @@ export function DeviceProvider({ children }) {
     }
 
     let active = true
+    // Hold the CPU and Wi-Fi awake for as long as this device stays paired.
+    startBackgroundGuardian()
+
     const handlePhoneAlert = async (alert) => {
       if (!alert?.alert_id) return
       const processedKey = 'divyadrishti-processed-alert-ids'
@@ -159,40 +185,84 @@ export function DeviceProvider({ children }) {
         processed = []
       }
       if (!Array.isArray(processed)) processed = []
-      if (processed.includes(Number(alert.alert_id))) return
-      processed = [...processed, Number(alert.alert_id)].slice(-80)
-      window.localStorage.setItem(processedKey, JSON.stringify(processed))
-      window.localStorage.setItem(LAST_PHONE_ALERT_KEY, String(alert.alert_id))
 
+      // Use created_at+id so Pi reboot (alert ids restart at 1) cannot skip fresh photos.
+      const alertKey = `${alert.created_at || ''}:${alert.alert_id}`
       const isDescribe = alert.kind === 'describe' || alert.kind === 'read'
       const isSnapshotOnly = alert.kind === 'obstacle_snapshot' || alert.speak === false
       const speakText = alert.speak_hi || alert.text_hi || ''
       const historyId = alert.replaces_alert_id
         ? `alert-${alert.replaces_alert_id}`
         : `alert-${alert.alert_id}`
+      const incomingImage = alert.image_jpeg_b64 || ''
+      const existing = loadObstacleHistory().find((row) => row.id === historyId)
+      const alreadyProcessed =
+        processed.includes(alertKey) || processed.includes(Number(alert.alert_id))
+      // Allow a later payload (e.g. Gemini replace / live refresh) to fill a missing photo.
+      const imageUpgrade = Boolean(incomingImage && existing && !existing.image_jpeg_b64)
+      if (alreadyProcessed && !imageUpgrade) return
+
+      processed = [...processed.filter((v) => v !== Number(alert.alert_id)), alertKey].slice(-80)
+      window.localStorage.setItem(processedKey, JSON.stringify(processed))
+      window.localStorage.setItem(LAST_PHONE_ALERT_KEY, String(alert.alert_id))
+
+      // Live ToF refreshes sometimes ship with no JPEG — don't overwrite History with blanks.
+      if (isSnapshotOnly && !incomingImage && !existing) return
+
+      // Glasses speech routed to this phone: say it, but keep it out of the photo list.
+      const isAnnouncement = alert.kind === 'announcement' || alert.source === 'glasses_voice'
+      if (isAnnouncement) {
+        await speakAlertOnce(speakText)
+        return
+      }
 
       const history = saveObstacleHistoryItem({
         id: historyId,
-        created_at: alert.created_at || new Date().toISOString(),
+        created_at: alert.created_at || existing?.created_at || new Date().toISOString(),
         event_type: alert.event_type || (isDescribe ? 'voice_command' : 'obstacle_ahead'),
         direction: alert.direction,
         distance_mm: alert.distance_mm,
-        speak_hi: speakText,
-        image_jpeg_b64: alert.image_jpeg_b64,
+        speak_hi: speakText || existing?.speak_hi || '',
+        image_jpeg_b64: incomingImage || existing?.image_jpeg_b64 || '',
         source: alert.source || alert.kind,
       })
       setObstacleHistory(history)
 
-      if (isDescribe || isSnapshotOnly || !speakText) return
-      if (speakingAlertRef.current) return
-      speakingAlertRef.current = true
+      // Glasses speaker is unreliable — guide on the phone when the app is open.
+      // Speak new obstacles + Read/Gemini; skip silent live photo refreshes (tof_live).
+      const isLiveRefresh = alert.source === 'tof_live'
+      const shouldSpeak =
+        Boolean(speakText)
+        && !isLiveRefresh
+        && (
+          isDescribe
+          || alert.speak === true
+          || alert.source === 'tof_snapshot'
+          || alert.kind === 'obstacle'
+          || alert.kind === 'read'
+          || alert.kind === 'describe'
+        )
+      if (!shouldSpeak) return
+
+      // Avoid repeating the same direction/distance while standing in place.
+      const speakBucket = `${alert.direction || 'ahead'}:${Math.round((alert.distance_mm || 0) / 150)}:${speakText}`
+      const lastSpeakKey = 'divyadrishti-last-obstacle-speak'
       try {
-        await speakGuidance(speakText)
-        if (device?.pairing_code) {
-          await sendNearbyCommand(device.pairing_code, 'unmute_haptics').catch(() => {})
+        const prev = JSON.parse(window.sessionStorage.getItem(lastSpeakKey) || 'null')
+        if (
+          prev?.bucket === speakBucket
+          && Date.now() - (prev?.at || 0) < (isDescribe ? 0 : 8_000)
+        ) {
+          return
         }
-      } finally {
-        speakingAlertRef.current = false
+        window.sessionStorage.setItem(lastSpeakKey, JSON.stringify({ bucket: speakBucket, at: Date.now() }))
+      } catch {
+        // ignore
+      }
+
+      await speakAlertOnce(speakText)
+      if (device?.pairing_code) {
+        await sendNearbyCommand(device.pairing_code, 'unmute_haptics').catch(() => {})
       }
     }
 
@@ -217,8 +287,9 @@ export function DeviceProvider({ children }) {
     return () => {
       active = false
       window.clearInterval(interval)
+      stopBackgroundGuardian()
     }
-  }, [device])
+  }, [device, speakAlertOnce])
 
   const pairDevice = async (pairingCode) => {
     if (isDemoMode) {
@@ -246,6 +317,14 @@ export function DeviceProvider({ children }) {
   }
 
   const describeNearbySurroundings = async () => {
+    if (isDemoMode) {
+      return {
+        status: 'ok',
+        text_hi: 'Mock read: wall par EXIT likha hai, neeche Gate 2 dikh raha hai.',
+        image_jpeg_b64: '',
+        source: 'read',
+      }
+    }
     if (!device?.pairing_code) throw new Error('Pair your glasses before asking them to read.')
     const result = await sendNearbyDescribe(device.pairing_code)
     setNearbyLink((prev) => ({ ...prev, state: 'connected' }))

@@ -7,7 +7,7 @@ import { signalGuidance, speakGuidance, tapFeedback } from '../services/sensoryF
 
 const FILTERS = [
   { id: 'obstacles', label: 'Obstacles' },
-  { id: 'all', label: 'All cloud' },
+  { id: 'all', label: 'Cloud log' },
   { id: 'hazard', label: 'Cloud hazards' },
   { id: 'voice_command', label: 'Voice' },
   { id: 'system', label: 'System' },
@@ -82,12 +82,12 @@ export default function History() {
 
       {filter === 'obstacles' && (
         <p className="mb-3 text-xs leading-5 text-mist-500">
-          Saved on this phone when glasses detect a nearby obstacle (within your Settings range) or you tap Read. Distances under 1 m show as cm. Tap a card to hear it again.
+          Phone photos + spoken distance — saved here when glasses detect a nearby obstacle (within your Settings range) or you tap Read. Best tab for demos. Distances under 1 m show as cm. Tap a card to hear it again.
         </p>
       )}
       {filter === 'all' && (
         <p className="mb-3 text-xs leading-5 text-mist-500">
-          Cloud log only — no live photos. For obstacle photos + correct spoken distance, use the Obstacles tab (needs phone and glasses on the same Wi‑Fi).
+          Cloud log only — text events without photos. For demos (and live obstacle photos + spoken distance), stay on Obstacles — phone and glasses need the same Wi‑Fi.
         </p>
       )}
 

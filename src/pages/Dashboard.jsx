@@ -9,6 +9,8 @@ import { alertLabel, formatDistanceMeters, isHazardEvent, timeAgo } from '../lib
 import { isDemoMode } from '../lib/supabaseClient'
 import { signalGuidance, speakGuidance } from '../services/sensoryFeedback'
 
+const GEMINI_UNAVAILABLE_KEY = 'divyadrishti-gemini-unavailable'
+
 function safetyState(status) {
   const updatedAt = status?.updated_at
   if (!updatedAt) return 'offline'
@@ -112,6 +114,13 @@ export default function Dashboard() {
     message: '',
     error: '',
   })
+  const [geminiUnavailable, setGeminiUnavailable] = useState(() => {
+    try {
+      return window.sessionStorage.getItem(GEMINI_UNAVAILABLE_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
   const state = safetyState(status)
   const sensingPaused = nearbyLink.status?.paused === true
   const displayState = sensingPaused ? 'paused' : state
@@ -120,23 +129,42 @@ export default function Dashboard() {
   const liveAlert = nearbyLink.status?.phone_alert
   // Prefer phone-local obstacle/read history (has photos). Fall back to live
   // nearby alert, then cloud events (text-only, often without a snapshot).
-  const latestObstacle = (obstacleHistory || []).find((row) =>
+  const obstacleRows = (obstacleHistory || []).filter((row) =>
     row?.event_type !== 'voice_command'
     && row?.source !== 'describe'
     && row?.source !== 'read',
-  ) || null
-  const latest = latestObstacle || obstacleHistory?.[0] || (liveAlert ? {
+  )
+  // Prefer a row that actually has a snapshot — empty live refreshes used to hide real photos.
+  const latestObstacle = obstacleRows.find((row) => row?.image_jpeg_b64 || row?.detail?.image_jpeg_b64)
+    || obstacleRows[0]
+    || null
+  const liveHasPhoto = Boolean(liveAlert?.image_jpeg_b64)
+  const latest = (liveHasPhoto ? {
     speak_hi: liveAlert.speak_hi || liveAlert.text_hi,
     created_at: liveAlert.created_at,
     event_type: liveAlert.event_type || 'obstacle_ahead',
     image_jpeg_b64: liveAlert.image_jpeg_b64,
     distance_mm: liveAlert.distance_mm,
     direction: liveAlert.direction,
-  } : null) || events?.[0]
+  } : null)
+    || latestObstacle
+    || obstacleHistory?.[0]
+    || (liveAlert ? {
+      speak_hi: liveAlert.speak_hi || liveAlert.text_hi,
+      created_at: liveAlert.created_at,
+      event_type: liveAlert.event_type || 'obstacle_ahead',
+      image_jpeg_b64: liveAlert.image_jpeg_b64,
+      distance_mm: liveAlert.distance_mm,
+      direction: liveAlert.direction,
+    } : null)
+    || events?.[0]
   const latestDistanceMm = latest?.distance_mm ?? latest?.detail?.distance_mm
   const sensingLive = !sensingPaused && (state === 'online' || state === 'alert')
-  const battery = status?.battery_pct == null ? 'Not reported' : `${Math.round(status.battery_pct)}%`
+  const batteryMissing = status?.battery_pct == null
+  const battery = batteryMissing ? '—' : `${Math.round(status.battery_pct)}%`
+  const batteryLabel = batteryMissing ? 'Battery · not shared' : 'Battery'
   const nearbyControlAvailable = !isDemoMode && nearbyLink.state === 'connected'
+  const showGeminiNotice = !isDemoMode
   const commandPending = sensingControl.pending !== null
   const describePending = describeControl.pending
 
@@ -166,6 +194,15 @@ export default function Dashboard() {
     }
   }
 
+  const markGeminiUnavailable = () => {
+    setGeminiUnavailable(true)
+    try {
+      window.sessionStorage.setItem(GEMINI_UNAVAILABLE_KEY, '1')
+    } catch {
+      // ignore
+    }
+  }
+
   const runDescribe = async () => {
     if (describePending) return
 
@@ -178,19 +215,6 @@ export default function Dashboard() {
     })
 
     try {
-      if (isDemoMode) {
-        const textHi = 'Mock read: wall par EXIT likha hai, neeche Gate 2 dikh raha hai.'
-        await speakGuidance(textHi)
-        setDescribeControl({
-          pending: false,
-          textHi,
-          imageJpegB64: '',
-          message: 'Demo read ready.',
-          error: '',
-        })
-        return
-      }
-
       const result = await describeNearbySurroundings()
       if (result?.status === 'cooldown') {
         const wait = result.retry_after_seconds ?? 8
@@ -205,13 +229,15 @@ export default function Dashboard() {
       }
 
       const geminiError = String(result?.error || '')
-      if (result?.status === 'error' && (/429|quota|billing/i.test(geminiError) || !result?.text_hi?.trim())) {
+      const quotaHit = /429|quota|billing/i.test(geminiError)
+      if (result?.status === 'error' && (quotaHit || !result?.text_hi?.trim())) {
+        if (quotaHit) markGeminiUnavailable()
         setDescribeControl({
           pending: false,
           textHi: '',
           imageJpegB64: result?.image_jpeg_b64 || '',
           message: '',
-          error: /429|quota|billing/i.test(geminiError)
+          error: quotaHit
             ? 'Read failed: Gemini API quota exceeded. Add billing / wait for quota reset, then try again.'
             : (geminiError || 'Read failed on the glasses.'),
         })
@@ -222,16 +248,22 @@ export default function Dashboard() {
       if (!textHi) throw new Error(result?.error || 'No read text returned.')
 
       await speakGuidance(textHi)
-      try {
-        await sendNearbyDeviceCommand('unmute_haptics')
-      } catch {
-        // unmute is best-effort; Pi also auto-unmutes after 20s
+      if (!isDemoMode) {
+        try {
+          await sendNearbyDeviceCommand('unmute_haptics')
+        } catch {
+          // unmute is best-effort; Pi also auto-unmutes after 20s
+        }
       }
       setDescribeControl({
         pending: false,
         textHi,
         imageJpegB64: result?.image_jpeg_b64 || '',
-        message: result?.status === 'ok' ? 'Read ready — spoken on this phone.' : 'Read finished with a fallback message.',
+        message: isDemoMode
+          ? 'Demo Read ready.'
+          : result?.status === 'ok'
+            ? 'Read ready — spoken on this phone.'
+            : 'Read finished with a fallback message.',
         error: '',
       })
     } catch (error) {
@@ -318,6 +350,20 @@ export default function Dashboard() {
         )}
 
         <Card title="Read what’s in front" eyebrow="Camera · text / signs · phone speaker">
+          {showGeminiNotice && (
+            <p
+              className={`mb-3 rounded-xl border px-3 py-2 text-xs leading-5 ${
+                geminiUnavailable
+                  ? 'border-alert-500/40 bg-alert-500/10 text-alert-300'
+                  : 'border-night-600 bg-night-800/80 text-mist-400'
+              }`}
+              role="status"
+            >
+              {geminiUnavailable
+                ? 'Gemini unavailable (quota / billing). Read and AI naming may fail until billing is sorted — obstacle distance + photos still work.'
+                : 'Read / AI naming may be unavailable while Gemini billing is pending. Obstacle distance + photos still work.'}
+            </p>
+          )}
           <p className="text-sm leading-6 text-mist-400">
             Tap to capture one photo and read clear text or signs in Hinglish on this phone. Obstacle alerts stay separate — they only talk about nearby things in your sensitivity range.
           </p>
@@ -335,8 +381,8 @@ export default function Dashboard() {
             {describeControl.error
               || describeControl.message
               || (isDemoMode
-                ? 'Preview mode will speak a sample read result on this phone.'
-                : 'Tap to read — phone and glasses must be on the same Wi-Fi.')}
+                ? 'Preview mode will speak a sample Read result on this phone.'
+                : 'Tap Read for signs / text ahead — result speaks on this phone (same Wi‑Fi).')}
           </p>
           {describeControl.textHi && (
             <div className="mt-4 rounded-2xl border border-night-700 bg-night-900/60 p-4">
@@ -388,7 +434,7 @@ export default function Dashboard() {
             </p>
           )}
           <div className="grid grid-cols-3 divide-x divide-night-700">
-            <div className="pr-3"><BatteryMedium size={19} className="mb-2 text-signal-400" /><p className="font-data text-sm text-mist-100">{battery}</p><p className="mt-0.5 text-xs text-mist-500">Battery</p></div>
+            <div className="pr-3"><BatteryMedium size={19} className="mb-2 text-signal-400" /><p className="font-data text-sm text-mist-100">{battery}</p><p className="mt-0.5 text-xs text-mist-500">{batteryLabel}</p></div>
             <div className="px-3"><Radio size={19} className="mb-2 text-safe-400" /><p className="text-lg font-semibold text-mist-100">{nearbyLink.state === 'connected' ? 'Nearby' : state === 'offline' ? 'Delayed' : sensingLive ? 'Live' : 'Check'}</p><p className="mt-0.5 text-xs text-mist-500">Safety link</p></div>
             <div className="pl-3"><Eye size={19} className="mb-2 text-signal-400" /><p className="text-lg font-semibold text-mist-100">{sensingLive ? 'ToF' : status?.mode === 'camera_fallback' ? 'Camera' : 'Waiting'}</p><p className="mt-0.5 text-xs text-mist-500">Guidance</p></div>
           </div>

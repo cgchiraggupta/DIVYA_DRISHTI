@@ -25,6 +25,11 @@
 
         </activity>
 
+        <service
+            android:name=".GuardianService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -40,6 +45,14 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Guidance must survive a pocketed phone: a foreground service plus wake
+         and Wi-Fi locks keep the obstacle poll and spoken alerts running. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <!-- BLE Wi-Fi provisioning. Android 12+ splits Bluetooth into runtime
          permissions; neverForLocation lets us scan without location access
          because provisioning does not derive the user's position. -->

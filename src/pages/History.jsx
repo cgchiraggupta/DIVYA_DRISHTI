@@ -61,7 +61,7 @@ export default function History() {
   }
 
   return (
-    <Layout title="Alert History" subtitle="Obstacle photos + Hinglish on this phone">
+    <Layout title="Alert History" subtitle="Hindi guidance on this phone · numbers in cm / m">
       <div className="flex gap-2 overflow-x-auto pb-4 -mx-1 px-1">
         {FILTERS.map((f) => (
           <button
@@ -104,7 +104,8 @@ export default function History() {
           const Icon = eventIcon(event.event_type)
           const hazard = isHazardEvent(event.event_type) || filter === 'obstacles'
           const speakText = event.speak_hi || event.detail?.speak_hi || event.detail?.message
-          const image = event.image_jpeg_b64 || event.detail?.image_jpeg_b64
+          const isDescribe = event.source === 'describe' || event.source === 'read' || event.event_type === 'voice_command'
+          const image = isDescribe ? (event.image_jpeg_b64 || event.detail?.image_jpeg_b64) : ''
           const key = event.id || `${event.created_at}-${event.event_type}`
           return (
             <li key={key}>

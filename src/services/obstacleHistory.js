@@ -1,5 +1,5 @@
 /**
- * Phone-local obstacle history (photos + Hinglish text).
+ * Phone-local obstacle history (photos + Hindi text).
  * Kept on-device so large snapshots don't depend on cloud row size.
  */
 

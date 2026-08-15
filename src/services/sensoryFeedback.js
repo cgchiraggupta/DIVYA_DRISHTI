@@ -3,7 +3,7 @@ import { Haptics, ImpactStyle } from '@capacitor/haptics'
 import { TextToSpeech } from '@capacitor-community/text-to-speech'
 import { isSarvamConfigured, speakWithSarvam } from './sarvamTts'
 
-/** Hinglish written in Latin script reads far better on an en-IN voice. */
+/** Devanagari → hi-IN. Latin fallback stays en-IN for mixed device voices. */
 function voiceLangFor(text) {
   return /[\u0900-\u097F]/.test(text) ? 'hi-IN' : 'en-IN'
 }

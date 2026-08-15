@@ -10,6 +10,44 @@ const DeviceContext = createContext(undefined)
 const PAIRING_CODE_KEY = 'divya-drishti-pairing-code'
 const LAST_PHONE_ALERT_KEY = 'divyadrishti-last-phone-alert-id'
 
+/**
+ * Short two-tone cue before an auto-describe speaks. This speech was not
+ * requested by tapping anything, so the cue tells the person "the glasses
+ * noticed something on their own" before the description starts, distinct
+ * from an obstacle alert's buzz/beep.
+ */
+function playAutoDescribeCue() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext
+    if (!Ctx) return Promise.resolve()
+    const ctx = new Ctx()
+    const now = ctx.currentTime
+    const gain = ctx.createGain()
+    gain.gain.setValueAtTime(0.001, now)
+    gain.gain.exponentialRampToValueAtTime(0.2, now + 0.02)
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22)
+    gain.connect(ctx.destination)
+
+    const osc = ctx.createOscillator()
+    osc.type = 'sine'
+    osc.frequency.setValueAtTime(880, now)
+    osc.frequency.setValueAtTime(1320, now + 0.11)
+    osc.connect(gain)
+    osc.start(now)
+    osc.stop(now + 0.24)
+
+    return new Promise((resolve) => {
+      osc.onended = () => {
+        ctx.close().catch(() => {})
+        resolve()
+      }
+      window.setTimeout(resolve, 300)
+    })
+  } catch {
+    return Promise.resolve()
+  }
+}
+
 export function DeviceProvider({ children }) {
   const [device, setDevice] = useState(null)
   const [status, setStatus] = useState(null)
@@ -188,26 +226,25 @@ export function DeviceProvider({ children }) {
 
       // Use created_at+id so Pi reboot (alert ids restart at 1) cannot skip fresh photos.
       const alertKey = `${alert.created_at || ''}:${alert.alert_id}`
-      const isDescribe = alert.kind === 'describe' || alert.kind === 'read'
+      const isAutoDescribe = alert.kind === 'auto_describe'
+      const isDescribe = alert.kind === 'describe' || alert.kind === 'read' || isAutoDescribe
       const isSnapshotOnly = alert.kind === 'obstacle_snapshot' || alert.speak === false
       const speakText = alert.speak_hi || alert.text_hi || ''
       const historyId = alert.replaces_alert_id
         ? `alert-${alert.replaces_alert_id}`
         : `alert-${alert.alert_id}`
-      const incomingImage = alert.image_jpeg_b64 || ''
+      const incomingImage = isDescribe ? (alert.image_jpeg_b64 || '') : ''
       const existing = loadObstacleHistory().find((row) => row.id === historyId)
       const alreadyProcessed =
         processed.includes(alertKey) || processed.includes(Number(alert.alert_id))
-      // Allow a later payload (e.g. Gemini replace / live refresh) to fill a missing photo.
-      const imageUpgrade = Boolean(incomingImage && existing && !existing.image_jpeg_b64)
-      if (alreadyProcessed && !imageUpgrade) return
+      if (alreadyProcessed) return
 
       processed = [...processed.filter((v) => v !== Number(alert.alert_id)), alertKey].slice(-80)
       window.localStorage.setItem(processedKey, JSON.stringify(processed))
       window.localStorage.setItem(LAST_PHONE_ALERT_KEY, String(alert.alert_id))
 
-      // Live ToF refreshes sometimes ship with no JPEG — don't overwrite History with blanks.
-      if (isSnapshotOnly && !incomingImage && !existing) return
+      // Obstacle photos are not sent to the phone — still speak and keep text history.
+      if (isSnapshotOnly && !speakText && !existing) return
 
       // Glasses speech routed to this phone: say it, but keep it out of the photo list.
       const isAnnouncement = alert.kind === 'announcement' || alert.source === 'glasses_voice'
@@ -223,7 +260,7 @@ export function DeviceProvider({ children }) {
         direction: alert.direction,
         distance_mm: alert.distance_mm,
         speak_hi: speakText || existing?.speak_hi || '',
-        image_jpeg_b64: incomingImage || existing?.image_jpeg_b64 || '',
+        image_jpeg_b64: isDescribe ? (incomingImage || existing?.image_jpeg_b64 || '') : '',
         source: alert.source || alert.kind,
       })
       setObstacleHistory(history)
@@ -260,6 +297,9 @@ export function DeviceProvider({ children }) {
         // ignore
       }
 
+      // This speech wasn't requested by tapping anything — cue it first so
+      // it's clearly the glasses noticing something, not an obstacle alert.
+      if (isAutoDescribe) await playAutoDescribeCue()
       await speakAlertOnce(speakText)
       if (device?.pairing_code) {
         await sendNearbyCommand(device.pairing_code, 'unmute_haptics').catch(() => {})
@@ -320,7 +360,7 @@ export function DeviceProvider({ children }) {
     if (isDemoMode) {
       return {
         status: 'ok',
-        text_hi: 'Mock read: wall par EXIT likha hai, neeche Gate 2 dikh raha hai.',
+        text_hi: 'सामने दीवार है। बोर्ड पर लिखा है EXIT। नीचे लेबल पर Gate 2 लिखा है।',
         image_jpeg_b64: '',
         source: 'read',
       }

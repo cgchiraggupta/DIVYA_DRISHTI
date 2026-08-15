@@ -164,7 +164,6 @@ export default function Dashboard() {
   const battery = batteryMissing ? '—' : `${Math.round(status.battery_pct)}%`
   const batteryLabel = batteryMissing ? 'Battery · not shared' : 'Battery'
   const nearbyControlAvailable = !isDemoMode && nearbyLink.state === 'connected'
-  const showGeminiNotice = !isDemoMode
   const commandPending = sensingControl.pending !== null
   const describePending = describeControl.pending
 
@@ -229,23 +228,23 @@ export default function Dashboard() {
       }
 
       const geminiError = String(result?.error || '')
-      const quotaHit = /429|quota|billing/i.test(geminiError)
-      if (result?.status === 'error' && (quotaHit || !result?.text_hi?.trim())) {
-        if (quotaHit) markGeminiUnavailable()
+      const geminiBlocked = /429|401|403|quota|billing|unauth/i.test(geminiError)
+      if (result?.status === 'error' && (geminiBlocked || !result?.text_hi?.trim())) {
+        if (geminiBlocked) markGeminiUnavailable()
         setDescribeControl({
           pending: false,
           textHi: '',
           imageJpegB64: result?.image_jpeg_b64 || '',
           message: '',
-          error: quotaHit
-            ? 'Read failed: Gemini API quota exceeded. Add billing / wait for quota reset, then try again.'
-            : (geminiError || 'Read failed on the glasses.'),
+          error: geminiBlocked
+            ? 'Describe failed: Gemini key/quota. Put the new billed key on the glasses, then try again.'
+            : (geminiError || 'Describe failed on the glasses.'),
         })
         return
       }
 
       const textHi = result?.text_hi?.trim() || ''
-      if (!textHi) throw new Error(result?.error || 'No read text returned.')
+      if (!textHi) throw new Error(result?.error || 'No description returned.')
 
       await speakGuidance(textHi)
       if (!isDemoMode) {
@@ -260,10 +259,10 @@ export default function Dashboard() {
         textHi,
         imageJpegB64: result?.image_jpeg_b64 || '',
         message: isDemoMode
-          ? 'Demo Read ready.'
+          ? 'Demo description ready.'
           : result?.status === 'ok'
-            ? 'Read ready — spoken on this phone.'
-            : 'Read finished with a fallback message.',
+            ? 'Describe ready — spoken on this phone.'
+            : 'Describe finished with a fallback message.',
         error: '',
       })
     } catch (error) {
@@ -274,7 +273,7 @@ export default function Dashboard() {
         message: '',
         error: error?.message?.includes('Glasses') || error?.message?.includes('reach')
           ? 'Could not reach glasses. Same Wi-Fi chahiye phone aur glasses ka.'
-          : 'Abhi read nahi ho paya. Thodi der baad phir try karein.',
+          : 'अभी बता नहीं पाए। थोड़ी देर बाद फिर कोशिश करें।',
       })
     }
   }
@@ -349,23 +348,17 @@ export default function Dashboard() {
           </Card>
         )}
 
-        <Card title="Read what’s in front" eyebrow="Camera · text / signs · phone speaker">
-          {showGeminiNotice && (
+        <Card title="What’s in front" eyebrow="Camera · objects · signs · phone speaker">
+          {geminiUnavailable && (
             <p
-              className={`mb-3 rounded-xl border px-3 py-2 text-xs leading-5 ${
-                geminiUnavailable
-                  ? 'border-alert-500/40 bg-alert-500/10 text-alert-300'
-                  : 'border-night-600 bg-night-800/80 text-mist-400'
-              }`}
+              className="mb-3 rounded-xl border border-alert-500/40 bg-alert-500/10 px-3 py-2 text-xs leading-5 text-alert-300"
               role="status"
             >
-              {geminiUnavailable
-                ? 'Gemini unavailable (quota / billing). Read and AI naming may fail until billing is sorted — obstacle distance + photos still work.'
-                : 'Read / AI naming may be unavailable while Gemini billing is pending. Obstacle distance + photos still work.'}
+              Gemini unavailable. Describe and AI naming may fail until the new API key works — obstacle distance + photos still work.
             </p>
           )}
           <p className="text-sm leading-6 text-mist-400">
-            Tap to capture one photo and read clear text or signs in Hinglish on this phone. Obstacle alerts stay separate — they only talk about nearby things in your sensitivity range.
+            Tap to capture one photo. The phone speaks Hindi: what is in front, nearby obstacles, and any signboard text. Distance stays English, like 80 cm or 1 m.
           </p>
           <button
             type="button"
@@ -374,19 +367,19 @@ export default function Dashboard() {
             className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-signal-500 px-4 py-3 text-sm font-bold text-night-950 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
           >
             {describePending
-              ? <><LoaderCircle className="animate-spin" size={17} /> Reading…</>
-              : <><ScanEye size={17} /> Read</>}
+              ? <><LoaderCircle className="animate-spin" size={17} /> Describing…</>
+              : <><ScanEye size={17} /> Describe</>}
           </button>
           <p className="mt-3 text-xs leading-5 text-mist-500" role={describeControl.error ? 'alert' : 'status'} aria-live="polite">
             {describeControl.error
               || describeControl.message
               || (isDemoMode
-                ? 'Preview mode will speak a sample Read result on this phone.'
-                : 'Tap Read for signs / text ahead — result speaks on this phone (same Wi‑Fi).')}
+                ? 'Preview mode will speak a sample Hindi description on this phone.'
+                : 'Tap Describe — result speaks Hindi on this phone (same Wi‑Fi).')}
           </p>
           {describeControl.textHi && (
             <div className="mt-4 rounded-2xl border border-night-700 bg-night-900/60 p-4">
-              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-mist-500">Read result</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-mist-500">Description</p>
               <p className="mt-2 text-sm leading-6 text-mist-100">{describeControl.textHi}</p>
               <button
                 type="button"
@@ -414,9 +407,9 @@ export default function Dashboard() {
             sensingLive ? 'safe' : 'alert'
           )}
           {capabilityRow(
-            'Camera and text reading',
+            'Camera describe and OCR',
             status?.camera_ok ? 'Available' : 'Unavailable',
-            status?.camera_ok ? 'Camera awareness and text reading can provide extra context.' : 'Obstacle sensing can continue without the camera.',
+            status?.camera_ok ? 'Camera can describe what’s in front and read visible signs.' : 'Obstacle sensing can continue without the camera.',
             status?.camera_ok ? 'safe' : 'neutral'
           )}
           {capabilityRow(
@@ -460,23 +453,16 @@ export default function Dashboard() {
                   'History → Obstacles',
                 ].filter(Boolean).join(' · ')
               : nearbyControlAvailable
-                ? 'When ToF buzzes within your Settings range, the photo and short label land here.'
+                ? 'When ToF buzzes within your Settings range, Hindi guidance speaks on this phone — even if the screen is off.'
                 : 'Connect nearby Wi‑Fi, then walk toward something inside your Settings range.'}
           </p>
-          {(latest?.image_jpeg_b64 || latest?.detail?.image_jpeg_b64) && (
-            <img
-              alt="Obstacle snapshot from glasses camera"
-              src={`data:image/jpeg;base64,${latest.image_jpeg_b64 || latest.detail.image_jpeg_b64}`}
-              className="mt-4 w-full rounded-2xl border border-night-700 object-cover"
-            />
-          )}
         </Card>
 
         {isDemoMode && (
           <Card title="Feel the guidance" eyebrow="Live preview">
             <p className="mb-4 text-sm leading-6 text-mist-400">Every preview speaks in an Indian voice and vibrates your phone, like the glasses will do in use.</p>
             <button
-              onClick={() => signalGuidance({ text: 'सामने कुर्सी है। लगभग 60 सेंटीमीटर दूर।', isHazard: true })}
+              onClick={() => signalGuidance({ text: 'सामने कुर्सी है। लगभग 60 cm।', isHazard: true })}
               className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl bg-signal-500 px-4 py-3 text-sm font-bold text-night-950 active:scale-[0.99]"
             >
               <Waves size={17} /> Test obstacle alert

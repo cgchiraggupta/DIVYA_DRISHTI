@@ -1,53 +1,17 @@
 ---
 description: Fast Android APK build and install for DeepGear TST companion app
-globs: android/**,src/**,capacitor.config.*
+globs: android/**,src/**,capacitor.config.*,scripts/android-fast-install.sh
 alwaysApply: false
 ---
 
 # Android APK — fast build & install
 
-Test phone ADB serial: `0015935A7000905`
+Follow `.cursor/skills/android-apk-install/SKILL.md`. Test phone: `0015935A7000905`.
 
-## Default: one command (~20–40s)
+Default:
 
 ```bash
 npm run android:install
 ```
 
-This runs `scripts/android-fast-install.sh`:
-1. `vite build` (web only)
-2. `rsync` dist → `android/app/src/main/assets/public` (skip slow/hung `cap sync` for JS-only)
-3. `./gradlew assembleDebug` (incremental — keep daemon warm)
-4. `adb install -r`
-
-**Do not** use `clean`, `gradlew --stop`, or full `npm run android:build` for normal UI fixes.
-
-## When to use the slow path
-
-Only if native Android/Java/plugins/`capacitor.config` changed:
-
-```bash
-npm run android:build
-adb -s 0015935A7000905 install -r android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-## Why installs felt slow before
-
-- Vite/cap sync hung in sandbox or cold starts (minutes)
-- `gradlew clean` / `--stop` killed the warm daemon
-- Full Capacitor sync when only React/JS changed
-- Package timeout after stopping daemons
-
-## JDK
-
-Project-scoped in `android/gradlew` → `/opt/homebrew/opt/openjdk@21/...`
-
-## If Gradle breaks (dex / NoSuchFile)
-
-```bash
-cd android && ./gradlew --stop
-rm -rf app/build build
-./gradlew assembleDebug
-```
-
-Then go back to `npm run android:install` next time.
+Do **not** run `npx vite build` from a Cursor agent shell (hangs, 0% CPU, no logs). The script uses `CI=1 node ./node_modules/vite/bin/vite.js build`. New `lucide-react` icons must be exported from `src/lib/lucide.js` first.

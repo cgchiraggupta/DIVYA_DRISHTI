@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { AlertTriangle, BatteryMedium, Check, ChevronRight, Eye, Footprints, LoaderCircle, Pause, Play, Radio, ScanEye, Sparkles, Type, Volume2, Waves } from 'lucide-react'
+import { AlertTriangle, BatteryMedium, Check, ChevronRight, Eye, Footprints, LoaderCircle, Mic, MicOff, Pause, Play, Radio, ScanEye, Sparkles, Type, Volume2, Waves } from 'lucide-react'
 import Layout from '../components/Layout'
 import Card from '../components/Card'
 import StatusPulse from '../components/StatusPulse'
@@ -7,6 +7,7 @@ import { useDevice } from '../context/DeviceContext'
 import { previewScenes } from '../lib/demoData'
 import { alertLabel, formatDistanceMeters, isHazardEvent, timeAgo } from '../lib/format'
 import { isDemoMode } from '../lib/supabaseClient'
+import { useVoiceCommands } from '../hooks/useVoiceCommands'
 import { signalGuidance, speakGuidance } from '../services/sensoryFeedback'
 
 const GEMINI_UNAVAILABLE_KEY = 'divyadrishti-gemini-unavailable'
@@ -285,6 +286,22 @@ export default function Dashboard() {
     }
   }
 
+  const getDistanceMm = () => (
+    liveAlert?.distance_mm
+    ?? latestDistanceMm
+    ?? nearbyLink.status?.phone_alert?.distance_mm
+    ?? null
+  )
+
+  const voice = useVoiceCommands({
+    runVision,
+    sendNearbyDeviceCommand,
+    nearbyControlAvailable,
+    getDistanceMm,
+    describePending,
+    commandPending,
+  })
+
   if (loading) return <Layout title="Divya Drishti"><p className="text-mist-400 text-sm">Getting your device ready…</p></Layout>
 
   return (
@@ -354,6 +371,39 @@ export default function Dashboard() {
             </div>
           </Card>
         )}
+
+        <Card title="Voice commands" eyebrow="Phone mic · Google speech · glasses still do the work">
+          <p className="text-sm leading-6 text-mist-400">
+            Mic and speaker are this phone until the glasses hardware is ready. Double-tap on the glasses still Describes. Say Hey Divya, then a command — or tap Listen.
+          </p>
+          <button
+            type="button"
+            onClick={voice.listenOnce}
+            disabled={voice.listening || voice.busy || !!describePending}
+            className={`mt-4 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50 ${voice.listening ? 'bg-alert-500 text-night-950' : 'bg-signal-500 text-night-950'}`}
+          >
+            {voice.listening
+              ? <><LoaderCircle className="animate-spin" size={17} /> Listening…</>
+              : <><Mic size={17} /> Listen</>}
+          </button>
+          <button
+            type="button"
+            onClick={voice.toggleHandsFree}
+            className={`mt-2 flex w-full items-center justify-center gap-2 rounded-xl border px-4 py-3 text-sm font-bold transition active:scale-[0.99] ${voice.handsFree ? 'border-signal-500/60 bg-signal-500/10 text-signal-300' : 'border-night-600 bg-night-800 text-mist-100'}`}
+          >
+            {voice.handsFree
+              ? <><MicOff size={17} /> Stop hands-free</>
+              : <><Mic size={17} /> Keep listening for Hey Divya</>}
+          </button>
+          <p className="mt-3 text-xs leading-5 text-mist-500" role={voice.status.error ? 'alert' : 'status'} aria-live="polite">
+            {voice.status.error
+              || voice.status.message
+              || 'Try: what’s ahead · पढ़ो · कितनी दूर · रुक जाओ · शुरू करो · मदद'}
+          </p>
+          {voice.status.transcript && (
+            <p className="mt-2 text-xs leading-5 text-mist-400">Heard: {voice.status.transcript}</p>
+          )}
+        </Card>
 
         <Card title="What’s in front" eyebrow="Camera · objects or sign text · phone speaker">
           {geminiUnavailable && (
@@ -435,9 +485,9 @@ export default function Dashboard() {
           )}
           {capabilityRow(
             'Audio and haptics',
-            'Status unavailable',
-            'The glasses do not yet report output self-check results to the app.',
-            'neutral'
+            'Phone stand-in',
+            'Mic and speaker are this phone. Glasses I²S will take over when hardware is ready. Double-tap still Describes.',
+            'signal'
           )}
         </Card>
 

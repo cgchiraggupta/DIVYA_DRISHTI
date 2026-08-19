@@ -17,7 +17,7 @@ export function isSarvamConfigured() {
   return Boolean(apiKey())
 }
 
-function stopActiveAudio() {
+export function stopSarvamAudio() {
   if (!activeAudio) return
   try {
     activeAudio.pause()
@@ -26,6 +26,10 @@ function stopActiveAudio() {
     // ignore cleanup errors
   }
   activeAudio = null
+}
+
+function stopActiveAudio() {
+  stopSarvamAudio()
 }
 
 function playBase64Wav(base64, volume = 1) {

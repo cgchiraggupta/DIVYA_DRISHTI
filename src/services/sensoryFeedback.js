@@ -1,7 +1,13 @@
 import { Capacitor } from '@capacitor/core'
 import { Haptics, ImpactStyle } from '@capacitor/haptics'
 import { TextToSpeech } from '@capacitor-community/text-to-speech'
-import { isSarvamConfigured, speakWithSarvam } from './sarvamTts'
+import { isSarvamConfigured, speakWithSarvam, stopSarvamAudio } from './sarvamTts'
+
+let lastSpokenText = ''
+
+export function getLastSpokenText() {
+  return lastSpokenText
+}
 
 /** Devanagari → hi-IN. Latin fallback stays en-IN for mixed device voices. */
 function voiceLangFor(text) {
@@ -43,8 +49,20 @@ async function deviceSpeech(text, volume) {
  * straight to the offline device voice — no network hop before a safety cue.
  * Longer Read/OCR text prefers the Sarvam Indian voice and falls back.
  */
+export async function stopSpeech() {
+  stopSarvamAudio()
+  if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+  if (!Capacitor.isNativePlatform()) return
+  try {
+    await TextToSpeech.stop()
+  } catch {
+    // ignore — engine may not be speaking
+  }
+}
+
 export async function speakGuidance(text, volume = 1, { fast = false } = {}) {
   if (!text) return
+  lastSpokenText = text
 
   if (fast) {
     try {

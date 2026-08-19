@@ -484,6 +484,12 @@ export default function Settings() {
           )}
         </Card>
 
+        <Card eyebrow="Audio" title="Mic and speaker">
+          <p className="text-sm leading-6 text-mist-300">
+            Voice commands and spoken alerts use this phone until the glasses mic and speaker are working. Commands still run on the glasses.
+          </p>
+        </Card>
+
         <Card eyebrow="Detection" title="Detection range">
           <div className="mb-2 flex items-center gap-3">
             <Ruler size={18} className="text-signal-400" />

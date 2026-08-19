@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { AlertTriangle, BatteryMedium, Check, ChevronRight, Eye, Footprints, LoaderCircle, Pause, Play, Radio, ScanEye, Sparkles, Volume2, Waves } from 'lucide-react'
+import { AlertTriangle, BatteryMedium, Check, ChevronRight, Eye, Footprints, LoaderCircle, Pause, Play, Radio, ScanEye, Sparkles, Type, Volume2, Waves } from 'lucide-react'
 import Layout from '../components/Layout'
 import Card from '../components/Card'
 import StatusPulse from '../components/StatusPulse'
@@ -108,7 +108,8 @@ export default function Dashboard() {
   const { status, events, loading, nearbyLink, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, obstacleHistory } = useDevice()
   const [sensingControl, setSensingControl] = useState({ pending: null, message: '', error: '' })
   const [describeControl, setDescribeControl] = useState({
-    pending: false,
+    pending: null,
+    lastMode: 'describe',
     textHi: '',
     imageJpegB64: '',
     message: '',
@@ -202,11 +203,13 @@ export default function Dashboard() {
     }
   }
 
-  const runDescribe = async () => {
+  const runVision = async (mode) => {
     if (describePending) return
+    const kind = mode === 'read' ? 'read' : 'describe'
 
     setDescribeControl({
-      pending: true,
+      pending: kind,
+      lastMode: kind,
       textHi: '',
       imageJpegB64: '',
       message: '',
@@ -214,11 +217,12 @@ export default function Dashboard() {
     })
 
     try {
-      const result = await describeNearbySurroundings()
+      const result = await describeNearbySurroundings(kind)
       if (result?.status === 'cooldown') {
         const wait = result.retry_after_seconds ?? 8
         setDescribeControl({
-          pending: false,
+          pending: null,
+          lastMode: kind,
           textHi: '',
           imageJpegB64: '',
           message: '',
@@ -232,13 +236,14 @@ export default function Dashboard() {
       if (result?.status === 'error' && (geminiBlocked || !result?.text_hi?.trim())) {
         if (geminiBlocked) markGeminiUnavailable()
         setDescribeControl({
-          pending: false,
+          pending: null,
+          lastMode: kind,
           textHi: '',
           imageJpegB64: result?.image_jpeg_b64 || '',
           message: '',
           error: geminiBlocked
-            ? 'Describe failed: Gemini key/quota. Put the new billed key on the glasses, then try again.'
-            : (geminiError || 'Describe failed on the glasses.'),
+            ? `${kind === 'read' ? 'Read' : 'Describe'} failed: Gemini key/quota. Put the new billed key on the glasses, then try again.`
+            : (geminiError || `${kind === 'read' ? 'Read' : 'Describe'} failed on the glasses.`),
         })
         return
       }
@@ -255,19 +260,21 @@ export default function Dashboard() {
         }
       }
       setDescribeControl({
-        pending: false,
+        pending: null,
+        lastMode: kind,
         textHi,
         imageJpegB64: result?.image_jpeg_b64 || '',
         message: isDemoMode
-          ? 'Demo description ready.'
+          ? (kind === 'read' ? 'Demo sign text ready.' : 'Demo description ready.')
           : result?.status === 'ok'
-            ? 'Describe ready — spoken on this phone.'
-            : 'Describe finished with a fallback message.',
+            ? (kind === 'read' ? 'Read ready — spoken on this phone.' : 'Describe ready — spoken on this phone.')
+            : 'Finished with a fallback message.',
         error: '',
       })
     } catch (error) {
       setDescribeControl({
-        pending: false,
+        pending: null,
+        lastMode: kind,
         textHi: '',
         imageJpegB64: '',
         message: '',
@@ -348,38 +355,52 @@ export default function Dashboard() {
           </Card>
         )}
 
-        <Card title="What’s in front" eyebrow="Camera · objects · signs · phone speaker">
+        <Card title="What’s in front" eyebrow="Camera · objects or sign text · phone speaker">
           {geminiUnavailable && (
             <p
               className="mb-3 rounded-xl border border-alert-500/40 bg-alert-500/10 px-3 py-2 text-xs leading-5 text-alert-300"
               role="status"
             >
-              Gemini unavailable. Describe and AI naming may fail until the new API key works — obstacle distance + photos still work.
+              Gemini unavailable. Describe and Read may fail until the new API key works — obstacle distance + photos still work.
             </p>
           )}
           <p className="text-sm leading-6 text-mist-400">
-            Tap to capture one photo. The phone speaks Hindi: what is in front, nearby obstacles, and any signboard text. Distance stays English, like 80 cm or 1 m.
+            Describe names people and objects. Read speaks only printed text. Double-tap on the glasses is Describe. Phone speaks Hindi; distances stay like 80 cm.
           </p>
-          <button
-            type="button"
-            onClick={runDescribe}
-            disabled={describePending}
-            className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-signal-500 px-4 py-3 text-sm font-bold text-night-950 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {describePending
-              ? <><LoaderCircle className="animate-spin" size={17} /> Describing…</>
-              : <><ScanEye size={17} /> Describe</>}
-          </button>
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => runVision('describe')}
+              disabled={!!describePending}
+              className="flex items-center justify-center gap-2 rounded-xl bg-signal-500 px-3 py-3 text-sm font-bold text-night-950 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {describePending === 'describe'
+                ? <><LoaderCircle className="animate-spin" size={17} /> Describing…</>
+                : <><ScanEye size={17} /> Describe</>}
+            </button>
+            <button
+              type="button"
+              onClick={() => runVision('read')}
+              disabled={!!describePending}
+              className="flex items-center justify-center gap-2 rounded-xl border border-night-600 bg-night-800 px-3 py-3 text-sm font-bold text-mist-100 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {describePending === 'read'
+                ? <><LoaderCircle className="animate-spin" size={17} /> Reading…</>
+                : <><Type size={17} /> Read</>}
+            </button>
+          </div>
           <p className="mt-3 text-xs leading-5 text-mist-500" role={describeControl.error ? 'alert' : 'status'} aria-live="polite">
             {describeControl.error
               || describeControl.message
               || (isDemoMode
-                ? 'Preview mode will speak a sample Hindi description on this phone.'
-                : 'Tap Describe — result speaks Hindi on this phone (same Wi‑Fi).')}
+                ? 'Preview mode will speak a sample Hindi line on this phone.'
+                : 'Same Wi-Fi as the glasses. Point at a sign before Read.')}
           </p>
           {describeControl.textHi && (
             <div className="mt-4 rounded-2xl border border-night-700 bg-night-900/60 p-4">
-              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-mist-500">Description</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-mist-500">
+                {describeControl.lastMode === 'read' ? 'Sign text' : 'Description'}
+              </p>
               <p className="mt-2 text-sm leading-6 text-mist-100">{describeControl.textHi}</p>
               <button
                 type="button"
@@ -409,7 +430,7 @@ export default function Dashboard() {
           {capabilityRow(
             'Camera describe and OCR',
             status?.camera_ok ? 'Available' : 'Unavailable',
-            status?.camera_ok ? 'Camera can describe what’s in front and read visible signs.' : 'Obstacle sensing can continue without the camera.',
+            status?.camera_ok ? 'Describe names what is in front. Read speaks visible sign text.' : 'Obstacle sensing can continue without the camera.',
             status?.camera_ok ? 'safe' : 'neutral'
           )}
           {capabilityRow(

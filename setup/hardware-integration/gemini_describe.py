@@ -48,9 +48,9 @@ OBSTACLE_COOLDOWN_SECONDS = 6
 # moment the scene changes, so it needs more breathing room than a human
 # re-pressing a button on purpose.
 AUTO_DESCRIBE_COOLDOWN_SECONDS = 12
-MOCK_READ_HI = (
-    "सामने दीवार है। बोर्ड पर लिखा है EXIT। नीचे छोटे लेबल पर Gate 2 लिखा है।"
-)
+MOCK_DESCRIBE_HI = "सामने कुर्सी है। दाईं ओर एक व्यक्ति खड़ा है।"
+MOCK_OCR_HI = "बोर्ड पर लिखा है EXIT। नीचे Gate 2 लिखा है।"
+MOCK_READ_HI = MOCK_DESCRIBE_HI
 MOCK_OBSTACLE_HI = "सामने कुर्सी है, लगभग 80 cm।"
 
 # Spoken output: Hindi Devanagari. Distance numbers + cm/m stay English.
@@ -63,27 +63,41 @@ HINDI_TTS_RULES = (
     "screens, or posters — quote that text exactly as written. "
 )
 
-# On-demand button: scene in front + OCR for any visible writing.
-READ_PROMPT = (
-    "You are Divya Drishti for a blind or low-vision user looking through glasses. "
+# Double-tap / phone Describe: objects and space, not a full OCR pass.
+DESCRIBE_PROMPT = (
+    "You are Divya Drishti object mode for a blind walker looking through glasses. "
     + HINDI_TTS_RULES
-    + "Describe what is directly in front: "
-    "images or posters, objects and people, and nearby obstacles "
-    "(chair, table, wall, vehicle, stairs, pole). "
-    "If a signboard, label, screen, or any writing is visible, read it out (OCR). "
-    "Do NOT tour the far background. Max 50 words."
+    + "Name what is directly in front: people, furniture, walls, doors, vehicles, poles, "
+    "or stairs if clearly visible. Say side when obvious (सामने / बाईं ओर / दाईं ओर). "
+    "If a large sign is the main thing, say a board is there — do not read long text; "
+    "that is a separate Read action. Do NOT tour the far background. Max 40 words."
 )
+
+# Phone Read: printed text only.
+OCR_PROMPT = (
+    "You are Divya Drishti read mode for a blind user pointing the glasses at text. "
+    + HINDI_TTS_RULES
+    + "Read ONLY printed or on-screen text that is clearly visible "
+    "(signs, labels, posters, screens). Quote it exactly as written. "
+    "If several lines, read the main heading first, then one short extra line if useful. "
+    "If no writing is readable, say exactly: कोई लिखावट नहीं दिख रही। "
+    "Do NOT describe furniture, people, or the room. Max 40 words."
+)
+
+# Backward-compatible alias used by auto-describe until callers switch.
+READ_PROMPT = DESCRIBE_PROMPT
 
 # Auto obstacle alert: only the near obstacle that triggered ToF.
 OBSTACLE_PROMPT = (
     "You are Divya Drishti obstacle mode. A distance sensor fired: direction={direction}, "
     "measured distance about {distance}. User obstacle range setting is max {max_range}. "
     + HINDI_TTS_RULES
-    + "Look at the photo and name ONLY the nearby obstacle likely causing that reading "
-    "(roughly within {max_range}, toward {direction}). "
-    "Example: 'सामने कुर्सी है, लगभग 80 cm।' "
+    + "Look at the photo and name ONLY the nearby object likely causing that reading "
+    "(chair, person, door, wall, vehicle, pole, stairs — roughly within {max_range}, "
+    "toward {direction}). Example: 'सामने कुर्सी है, लगभग 80 cm।' "
     "Do NOT mention far walls, distant people, sky, or anything clearly beyond {max_range}. "
-    "If the near obstacle is unclear, say so briefly with the distance. Max 20 words."
+    "Do NOT read sign text. If the near object is unclear, say so briefly with the distance. "
+    "Max 20 words."
 )
 
 _cooldown_lock = threading.Lock()
@@ -217,14 +231,14 @@ def frame_to_jpeg_bytes(frame, quality: int = 70) -> bytes:
     return encoded.tobytes()
 
 
-def describe_frame(frame, *, include_image: bool = True, prompt: str | None = None) -> dict:
-    """On-demand scene + OCR for what's in front. Returns JSON-serializable dict.
+def describe_frame(frame, *, include_image: bool = True, prompt: str | None = None, mode: str = "describe") -> dict:
+    """On-demand look-ahead. mode='describe' names objects; mode='read' is OCR only.
 
     Shares _gemini_inflight_lock with every other Gemini call in this module
     (see its docstring) — if an obstacle-naming or auto-describe call is
-    already in flight, this returns "busy" immediately instead of stacking
-    a second concurrent request.
+    already in flight, this waits briefly instead of returning busy instantly.
     """
+    mode = "read" if str(mode).lower() == "read" else "describe"
     start = time.monotonic()
     remaining = cooldown_remaining()
     if remaining > 0:
@@ -232,6 +246,7 @@ def describe_frame(frame, *, include_image: bool = True, prompt: str | None = No
             "status": "cooldown",
             "text_hi": "",
             "source": "cooldown",
+            "mode": mode,
             "retry_after_seconds": int(remaining + 0.999),
         })
 
@@ -244,26 +259,28 @@ def describe_frame(frame, *, include_image: bool = True, prompt: str | None = No
             "status": "busy",
             "text_hi": "",
             "source": "busy",
-            "mode": "read",
+            "mode": mode,
         })
 
     try:
         _mark_describe_used()
         key = load_api_key()
         jpeg = frame_to_jpeg_bytes(frame)
+        chosen_prompt = prompt or (OCR_PROMPT if mode == "read" else DESCRIBE_PROMPT)
+        mock_hi = MOCK_OCR_HI if mode == "read" else MOCK_DESCRIBE_HI
 
         try:
             if not key or key == "mock":
-                text_hi = MOCK_READ_HI
+                text_hi = mock_hi
                 source = "mock"
             else:
-                text_hi = _call_gemini(jpeg, key, prompt or READ_PROMPT)
+                text_hi = _call_gemini(jpeg, key, chosen_prompt)
                 source = "gemini"
             result = {
                 "status": "ok",
                 "text_hi": text_hi,
                 "source": source,
-                "mode": "read",
+                "mode": mode,
             }
         except RuntimeError as error:
             result = {
@@ -271,7 +288,7 @@ def describe_frame(frame, *, include_image: bool = True, prompt: str | None = No
                 "text_hi": "अभी बता नहीं पाए। थोड़ी देर बाद फिर कोशिश करें।",
                 "source": "fallback",
                 "error": str(error),
-                "mode": "read",
+                "mode": mode,
             }
     finally:
         _gemini_inflight_lock.release()
@@ -282,8 +299,9 @@ def describe_frame(frame, *, include_image: bool = True, prompt: str | None = No
 
 
 def describe_scene_auto(frame, *, include_image: bool = True) -> dict:
-    """Same scene + OCR description as describe_frame(), but triggered by the
-    glasses' own camera-side scene-change detection instead of a button press.
+    """Ambient object/space description, not OCR.
+
+    Triggered by the glasses' camera schedule instead of a button press.
 
     Kept as a separate function (own cooldown clock) so the automatic path
     and the manual "Describe" button don't fight over the same cooldown
@@ -320,10 +338,10 @@ def describe_scene_auto(frame, *, include_image: bool = True) -> dict:
 
         try:
             if not key or key == "mock":
-                text_hi = MOCK_READ_HI
+                text_hi = MOCK_DESCRIBE_HI
                 source = "mock"
             else:
-                text_hi = _call_gemini(jpeg, key, READ_PROMPT)
+                text_hi = _call_gemini(jpeg, key, DESCRIBE_PROMPT)
                 source = "gemini"
             result = {
                 "status": "ok",

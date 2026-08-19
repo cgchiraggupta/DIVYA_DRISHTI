@@ -123,15 +123,20 @@ export function sendNearbyCommand(pairingCode, command) {
   })
 }
 
-/** On-demand Read (OCR / text in front). Longer timeout — Gemini may take several seconds. */
-export function sendNearbyDescribe(pairingCode) {
+/** On-demand Describe (objects) or Read (OCR). Longer timeout — Gemini may take several seconds. */
+export function sendNearbyDescribe(pairingCode, command = 'describe') {
+  const safeCommand = command === 'read' ? 'read' : 'describe'
   return request('/v1/command', pairingCode, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: 'read' }),
+    body: JSON.stringify({ command: safeCommand }),
     connectTimeout: 5_000,
     readTimeout: 20_000,
   })
+}
+
+export function sendNearbyRead(pairingCode) {
+  return sendNearbyDescribe(pairingCode, 'read')
 }
 
 /** Push settings to nearby glasses immediately (same Wi-Fi). Cloud ack remains separate. */

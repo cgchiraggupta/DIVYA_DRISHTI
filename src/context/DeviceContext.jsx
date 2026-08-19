@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { supabase, isDemoMode } from '../lib/supabaseClient'
 import { createDemoEvent, demoDevice, demoEvents, demoStatus, sceneSpeakText } from '../lib/demoData'
 import { signalGuidance, speakGuidance } from '../services/sensoryFeedback'
-import { getNearbyDeviceStatus, sendNearbyCommand, sendNearbyDescribe, clearNearbyDeviceUrlCache } from '../services/localDeviceLink'
+import { getNearbyDeviceStatus, sendNearbyCommand, sendNearbyDescribe, sendNearbyRead, clearNearbyDeviceUrlCache } from '../services/localDeviceLink'
 import { loadObstacleHistory, saveObstacleHistoryItem } from '../services/obstacleHistory'
 import { startBackgroundGuardian, stopBackgroundGuardian } from '../services/backgroundGuardian'
 
@@ -356,25 +356,31 @@ export function DeviceProvider({ children }) {
     return localStatus
   }
 
-  const describeNearbySurroundings = async () => {
+  const describeNearbySurroundings = async (mode = 'describe') => {
+    const kind = mode === 'read' ? 'read' : 'describe'
     if (isDemoMode) {
       return {
         status: 'ok',
-        text_hi: 'सामने दीवार है। बोर्ड पर लिखा है EXIT। नीचे लेबल पर Gate 2 लिखा है।',
+        text_hi: kind === 'read'
+          ? 'बोर्ड पर लिखा है EXIT। नीचे लेबल पर Gate 2 लिखा है।'
+          : 'सामने कुर्सी है। दाईं ओर एक व्यक्ति खड़ा है।',
         image_jpeg_b64: '',
-        source: 'read',
+        source: kind,
+        mode: kind,
       }
     }
-    if (!device?.pairing_code) throw new Error('Pair your glasses before asking them to read.')
-    const result = await sendNearbyDescribe(device.pairing_code)
+    if (!device?.pairing_code) throw new Error('Pair your glasses before asking them to look ahead.')
+    const result = kind === 'read'
+      ? await sendNearbyRead(device.pairing_code)
+      : await sendNearbyDescribe(device.pairing_code)
     setNearbyLink((prev) => ({ ...prev, state: 'connected' }))
     if (result?.status === 'ok' && result?.text_hi) {
       const history = saveObstacleHistoryItem({
-        id: `read-${Date.now()}`,
+        id: `${kind}-${Date.now()}`,
         event_type: 'voice_command',
         speak_hi: result.text_hi,
         image_jpeg_b64: result.image_jpeg_b64,
-        source: result.source || 'read',
+        source: kind,
       })
       setObstacleHistory(history)
     }

@@ -82,7 +82,7 @@ export default function History() {
 
       {filter === 'obstacles' && (
         <p className="mb-3 text-xs leading-5 text-mist-500">
-          Phone photos + spoken distance — saved here when glasses detect a nearby obstacle (within your Settings range) or you tap Read. Best tab for demos. Distances under 1 m show as cm. Tap a card to hear it again.
+          Phone photos + spoken distance — saved here on an obstacle, or when you tap Describe / Read. Best tab for demos. Distances under 1 m show as cm. Tap a card to hear it again.
         </p>
       )}
       {filter === 'all' && (
@@ -124,8 +124,10 @@ export default function History() {
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-mist-100">
                       {filter === 'obstacles'
-                        ? (event.source === 'describe' || event.source === 'read' || event.event_type === 'voice_command'
+                        ? (event.source === 'read'
                           ? 'Read'
+                          : event.source === 'describe'
+                          ? 'Describe'
                           : alertLabel(event.event_type))
                         : alertLabel(event.event_type)}
                     </p>

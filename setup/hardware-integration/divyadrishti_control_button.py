@@ -8,7 +8,7 @@ ToF, motors, or speaker.
 Actions (on release):
   one short tap (< 1.5s)     → wait DOUBLE_TAP_WINDOW_S; if no second tap,
                                 systemctl start divyadrishti-sensing.service
-  two short taps (double-tap) → "read/describe what's ahead" via the sensing
+  two short taps (double-tap) → describe what's ahead via the sensing
                                 service's local API (same as the phone Describe
                                 button). A single tap never describes.
   1.5s <= held < 3s           → dead zone (no-op, logged) — safety buffer so a
@@ -22,7 +22,7 @@ service's local API (127.0.0.1:8765/v1/command), the same endpoint the phone
 app calls. This script does not touch the camera, ToF, motors, or speaker
 itself — it only asks the sensing service to do what it already knows how to
 do. Requires: (1) divyadrishti-sensing.service is running with a local API that
-accepts {"command": "read"} — see apply_read_near_obstacle.py /
+accepts {"command": "describe"} — see apply_read_near_obstacle.py /
 apply_nearby_settings.py; (2) a pairing code exists at
 /home/pi/.divyadrishti/device.json (this daemon runs as root, so it reads that
 path explicitly rather than via $HOME).
@@ -139,7 +139,7 @@ def fire_start_sensing() -> None:
 
 
 def fire_describe() -> None:
-    logger.info("Decision: DOUBLE TAP → local API /v1/command read")
+    logger.info("Decision: DOUBLE TAP → local API /v1/command describe")
     threading.Thread(target=trigger_read_command, daemon=True).start()
 
 
@@ -180,7 +180,7 @@ def handle_short_tap() -> None:
 
 
 def trigger_read_command() -> None:
-    """Ask the sensing service to describe what's ahead — identical to the phone's Describe button."""
+    """Ask the sensing service to describe what's ahead — same as the phone Describe button."""
     code = local_pairing_code()
     if not code:
         logger.error("Read trigger: no pairing code available, not calling local API")
@@ -188,7 +188,7 @@ def trigger_read_command() -> None:
 
     request = urllib.request.Request(
         LOCAL_API_URL,
-        data=json.dumps({"command": "read"}).encode("utf-8"),
+        data=json.dumps({"command": "describe"}).encode("utf-8"),
         method="POST",
         headers={
             "Content-Type": "application/json",
@@ -210,7 +210,7 @@ def trigger_read_command() -> None:
             )
             if status in ("busy", "cooldown"):
                 logger.warning(
-                    "Read trigger: describe not spoken (%s) — Gemini slot was busy or on cooldown",
+                "Read trigger: describe not spoken (%s) — Gemini slot was busy or on cooldown",
                     status,
                 )
     except urllib.error.URLError as error:

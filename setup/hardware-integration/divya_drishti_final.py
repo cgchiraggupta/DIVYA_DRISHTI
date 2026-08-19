@@ -908,7 +908,7 @@ class LocalLinkHandler(BaseHTTPRequestHandler):
             try:
                 with camera_lock:
                     frame = picam2.capture_array()
-                result = describe_frame(frame, include_image=True)
+                result = describe_frame(frame, include_image=True, mode=command)
             except Exception as error:
                 print(f"[DESCRIBE] Failed: {error}")
                 set_haptics_muted(False)
@@ -921,13 +921,14 @@ class LocalLinkHandler(BaseHTTPRequestHandler):
                 return
             if result.get("text_hi"):
                 publish_phone_alert({
-                    "kind": "read",
+                    "kind": command,
                     "event_type": "voice_command",
                     "speak_hi": result["text_hi"],
                     "text_hi": result["text_hi"],
                     "image_jpeg_b64": result.get("image_jpeg_b64") or "",
-                    "source": result.get("source"),
-                    "speak": result.get("status") == "ok",
+                    "source": command,
+                    # Companion already speaks the HTTP result; don't double-TTS.
+                    "speak": False,
                 })
             # Keep motors quiet while phone speaks; companion can resume via resume/describe-done.
             # Auto-unmute after 20s as a safety net.
@@ -936,7 +937,7 @@ class LocalLinkHandler(BaseHTTPRequestHandler):
                 set_haptics_muted(False)
             threading.Thread(target=_unmute_later, daemon=True).start()
             queue_event("voice_command", {
-                "command": "read",
+                "command": command,
                 "source": "companion_app",
                 "status": result.get("status"),
                 "speak_hi": result.get("text_hi"),

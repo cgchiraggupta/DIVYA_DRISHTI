@@ -24,6 +24,7 @@ export { default as ShieldCheck } from 'lucide-react/dist/esm/icons/shield-check
 export { default as SlidersHorizontal } from 'lucide-react/dist/esm/icons/sliders-horizontal.mjs'
 export { default as Sparkles } from 'lucide-react/dist/esm/icons/sparkles.mjs'
 export { default as Stethoscope } from 'lucide-react/dist/esm/icons/stethoscope.mjs'
+export { default as Type } from 'lucide-react/dist/esm/icons/type.mjs'
 export { default as Vibrate } from 'lucide-react/dist/esm/icons/vibrate.mjs'
 export { default as Volume2 } from 'lucide-react/dist/esm/icons/volume-2.mjs'
 export { default as Waves } from 'lucide-react/dist/esm/icons/waves.mjs'

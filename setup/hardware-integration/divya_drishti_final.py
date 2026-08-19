@@ -71,6 +71,10 @@ HAPTIC_STATIONARY_TOLERANCE_MM = 80
 HAPTIC_APPROACH_DELTA_MM = 50
 HAPTIC_MOTION_WINDOW_S = 1.0
 HAPTIC_OPENING_BURST_COUNT = 2
+# Same-obstacle reminder buzz hard-stops this long after the opening burst.
+# A genuinely new event (closer, more urgent, or a new side) still re-alerts
+# through should_alert, independent of this cap. Live on the Pi since 2026-08-18.
+HAPTIC_MAX_CONTINUOUS_SECONDS = 3.0
 # Minimum gap before the opening burst may fire again for the same obstacle.
 # Without this, a flickering sensor restarts the burst every few frames.
 SIDE_REALERT_SECONDS = 2.5
@@ -1424,8 +1428,8 @@ def detection_loop(picam2, tof1, tof2, stop_event):
                 queue_status(event_type, mode)
                 last_status_sync = now
             if side is not None:
-                # Speak new or materially changed guidance once. While an
-                # obstacle remains, repeat only its directional haptic cue.
+                # Cane, not tour guide: buzz when closing in or already close.
+                # While an obstacle remains, repeat only its directional haptic.
                 clear_since = None
                 distance_mm = min(d for d in (tof_left, tof_right) if d is not None) \
                     if tof_left is not None or tof_right is not None else None
@@ -1461,17 +1465,19 @@ def detection_loop(picam2, tof1, tof2, stop_event):
                     newest_d = distance_samples[-1][1]
                     approaching_now = newest_d <= oldest_d - HAPTIC_APPROACH_DELTA_MM
                     stationary_now = abs(newest_d - oldest_d) <= HAPTIC_STATIONARY_TOLERANCE_MM
-                if opening_burst_at is not None and (now - opening_burst_at) >= 0.8:
+                since_burst = (now - opening_burst_at) if opening_burst_at is not None else None
+                if since_burst is not None and since_burst >= HAPTIC_MAX_CONTINUOUS_SECONDS:
+                    # Hard stop: this obstacle has already warned. Staying near
+                    # or slowly drifting toward it must not buzz indefinitely.
+                    approach_active = False
+                    haptic_quiet = True
+                elif since_burst is not None and since_burst >= 0.8:
                     if approaching_now:
                         approach_active = True
                         haptic_quiet = False
                     elif stationary_now:
                         approach_active = False
                         haptic_quiet = True
-                if haptic_quiet and approaching_now:
-                    # Was standing; started walking into the obstacle again.
-                    approach_active = True
-                    haptic_quiet = False
                 reminder_interval = HAPTIC_REPEAT_SECONDS.get(pattern, 2.5)
                 # Side-only caution/warning reminders are 1.5x slower than ahead.
                 # Rapid (urgent < 50cm) is never stretched — close calls keep pace.
@@ -1491,13 +1497,25 @@ def detection_loop(picam2, tof1, tof2, stop_event):
                     SIDE_ONLY_REALERT_SECONDS if side_only and not in_urgent
                     else SIDE_REALERT_SECONDS
                 )
+                # Presence in the 2 m cone is not a warning. Warn if:
+                # already in the face (<50 cm), or distance is falling, or
+                # there is no ToF number (camera fallback — don't go mute).
+                opening_worthy = (
+                    in_urgent
+                    or approaching_now
+                    or distance_mm is None
+                )
                 should_alert = (
-                    not obstacle_active
+                    (not obstacle_active and opening_worthy)
                     or (urgent_change and seconds_since_alert >= URGENT_REALERT_SECONDS)
                     or (direction_changed and seconds_since_alert >= side_realert_seconds)
                 )
                 if should_alert and seconds_since_alert < MIN_BURST_GAP_SECONDS:
                     should_alert = False
+                # Ears need traffic, not a list of bowls. Speak only when it
+                # is in the forward path or already urgent. Side pass-bys
+                # are a left/right buzz; double-tap Describe if they want the name.
+                speak_now = in_urgent or (not side_only) or distance_mm is None
 
                 if should_alert:
                     announcement = message if message != last_alert_message else None
@@ -1544,12 +1562,12 @@ def detection_loop(picam2, tof1, tof2, stop_event):
                         "image_jpeg_b64": "",
                         "source": "tof_snapshot",
                         # Phone TTS is primary while glasses speaker is unreliable.
-                        "speak": True,
+                        "speak": speak_now,
                     })
                     # Opening warning: two distinct buzzes, haptic only on glasses.
                     deliver_haptic_burst(side, pattern, HAPTIC_OPENING_BURST_COUNT)
                     queue_event(event_type, event_detail)
-                    if frame_copy is not None:
+                    if speak_now and frame_copy is not None:
                         threading.Thread(
                             target=obstacle_phone_guidance_worker,
                             args=(frame_copy, direction, distance_mm, event_type, image_b64, instant.get("alert_id")),

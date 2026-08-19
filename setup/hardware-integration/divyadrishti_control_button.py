@@ -71,7 +71,7 @@ SENSING_UNIT = "divyadrishti-sensing.service"
 # Hands-free "read/describe what's ahead" trigger — calls the sensing
 # service's own local API, the same one the phone app's Describe button uses.
 LOCAL_API_URL = "http://127.0.0.1:8765/v1/command"
-LOCAL_API_TIMEOUT_S = 6.0
+LOCAL_API_TIMEOUT_S = 25.0
 DEVICE_FILE = Path("/home/pi/.divyadrishti/device.json")
 
 logger = logging.getLogger("divyadrishti-control-button")
@@ -197,7 +197,22 @@ def trigger_read_command() -> None:
     )
     try:
         with urllib.request.urlopen(request, timeout=LOCAL_API_TIMEOUT_S) as response:
-            logger.info("Read trigger: local API responded %s", response.status)
+            body = response.read().decode("utf-8", errors="ignore")
+            status = ""
+            try:
+                status = json.loads(body).get("status", "")
+            except json.JSONDecodeError:
+                pass
+            logger.info(
+                "Read trigger: local API responded %s status=%s",
+                response.status,
+                status or "unknown",
+            )
+            if status in ("busy", "cooldown"):
+                logger.warning(
+                    "Read trigger: describe not spoken (%s) — Gemini slot was busy or on cooldown",
+                    status,
+                )
     except urllib.error.URLError as error:
         logger.error("Read trigger: local API call failed (%s): %s", LOCAL_API_URL, error)
 

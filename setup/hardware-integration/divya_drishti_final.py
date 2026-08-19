@@ -598,13 +598,15 @@ def apply_settings_from_companion(payload):
 
 
 # ---- Auto scene-describe: no button, camera decides on its own ----
-# Downscaled grayscale mean-abs-diff thresholds. NOT measured on the real
-# glasses camera yet — tune these against an actual walk-around test.
+# Ambient scan: once on camera/boot after the frame settles, then every
+# ~5 minutes — not on every scene diff (that was too chatty). See
+# DECISIONS_AND_LESSONS.md / 2026-08-18 note in apply_auto_scene_describe.py.
 SCENE_DIFF_SIZE = (80, 60)         # downscale target: cheap to diff, still enough signal
 SCENE_SETTLE_MAX_DIFF = 6.0        # frame-to-frame diff at/below this = "not moving right now"
 SCENE_SETTLE_SECONDS = 0.8         # must stay settled this long before we trust it
-SCENE_CHANGE_MIN_DIFF = 18.0       # settled frame vs last-described frame must differ at least this much
-AUTO_DESCRIBE_MAX_WAIT_SECONDS = 20.0  # give up retrying a "busy" (Gemini in use) attempt after this long
+SCENE_CHANGE_MIN_DIFF = 18.0       # skip only a literally-unchanged frame once the interval is due
+AUTO_DESCRIBE_INTERVAL_SECONDS = 300.0  # ~5 minutes between unprompted ambient descriptions
+AUTO_DESCRIBE_MAX_WAIT_SECONDS = 45.0  # retry through a busy Gemini slot long enough for a 35s call
 # A normal indoor room almost always has *something* within the default 2.5m
 # sensitivity range (a wall, furniture, a person), so obstacle_active can
 # stay true nearly continuously. Without a cap, a genuinely new scene would
@@ -619,7 +621,25 @@ _auto_describe_state = {
     "settled_since": None,
     "attempt_in_flight": False,
     "obstacle_blocked_since": None,
+    "last_spoken_at": None,
+    "startup_describe_due": True,
 }
+
+
+def reset_auto_describe_schedule(*, reason: str = "camera") -> None:
+    """Schedule one ambient describe as soon as the next frame settles."""
+    with _auto_describe_lock:
+        _auto_describe_state.update({
+            "ref_gray": None,
+            "prev_gray": None,
+            "settled_since": None,
+            "attempt_in_flight": False,
+            "obstacle_blocked_since": None,
+            "last_spoken_at": None,
+            "startup_describe_due": True,
+        })
+    print(f"[DESCRIBE] Auto scene-describe scheduled on {reason} "
+          f"(first settled frame, then every {AUTO_DESCRIBE_INTERVAL_SECONDS / 60:.0f} min)")
 
 
 def _scene_gray(frame):
@@ -667,7 +687,10 @@ def _auto_describe_worker(frame, gray_candidate):
                     })
                     with _auto_describe_lock:
                         _auto_describe_state["ref_gray"] = gray_candidate
-                    print("[DESCRIBE] Auto scene-describe spoken")
+                        _auto_describe_state["last_spoken_at"] = time.monotonic()
+                        _auto_describe_state["startup_describe_due"] = False
+                    print("[DESCRIBE] Auto scene-describe spoken (next ambient describe in "
+                          f"~{AUTO_DESCRIBE_INTERVAL_SECONDS / 60:.0f} min)")
             return
     except Exception as error:
         print(f"[DESCRIBE] Auto scene-describe failed: {error}")
@@ -677,9 +700,8 @@ def _auto_describe_worker(frame, gray_candidate):
 
 
 def maybe_auto_describe(frame, obstacle_active):
-    """Call once per detection_loop tick with the frame already captured for
-    CV — free/local on every tick, only calls Gemini when the scene has
-    genuinely settled on something new. See apply_auto_scene_describe.py."""
+    """Call once per detection_loop tick — ambient describe on first settle
+    after boot/camera-on, then every AUTO_DESCRIBE_INTERVAL_SECONDS."""
     if frame is None:
         return
     try:
@@ -716,7 +738,8 @@ def maybe_auto_describe(frame, obstacle_active):
                 f"[DESCRIBE] Auto scene-describe check: frame_diff={frame_diff:.1f} "
                 f"(settle<={SCENE_SETTLE_MAX_DIFF}) settled_for={settled_for:.1f}s "
                 f"(need>={SCENE_SETTLE_SECONDS}) diff_from_ref={diff_from_ref:.1f} "
-                f"(need>={SCENE_CHANGE_MIN_DIFF}) obstacle_active={obstacle_active}"
+                f"(need>={SCENE_CHANGE_MIN_DIFF}) obstacle_active={obstacle_active} "
+                f"startup_due={scene.get('startup_describe_due')}"
             )
 
         if scene["settled_since"] is None:
@@ -725,21 +748,27 @@ def maybe_auto_describe(frame, obstacle_active):
         if now - scene["settled_since"] < SCENE_SETTLE_SECONDS:
             return
 
-        if _mean_abs_diff(gray, scene["ref_gray"]) < SCENE_CHANGE_MIN_DIFF:
-            return
+        startup_due = bool(scene.get("startup_describe_due"))
+        last_spoken_at = scene.get("last_spoken_at")
 
-        if obstacle_active:
-            # Obstacle safety audio wins right now, and for a short grace
-            # period after — but not forever, or a normal room (something
-            # is almost always within range) would block this permanently.
+        if not startup_due:
+            if last_spoken_at is not None and now - last_spoken_at < AUTO_DESCRIBE_INTERVAL_SECONDS:
+                return
+            if (
+                last_spoken_at is not None
+                and _mean_abs_diff(gray, scene["ref_gray"]) < SCENE_CHANGE_MIN_DIFF
+            ):
+                return
+
+        if obstacle_active and not startup_due:
             if scene["obstacle_blocked_since"] is None:
                 scene["obstacle_blocked_since"] = now
                 return
             if now - scene["obstacle_blocked_since"] < OBSTACLE_DEFER_MAX_SECONDS:
                 return
-            # Waited long enough — describe anyway, same as if obstacle
-            # had cleared. Falls through to the existing fire-thread path.
         scene["obstacle_blocked_since"] = None
+        if startup_due:
+            scene["startup_describe_due"] = False
 
         scene["attempt_in_flight"] = True
 
@@ -890,7 +919,7 @@ class LocalLinkHandler(BaseHTTPRequestHandler):
                     "error": str(error),
                 })
                 return
-            if result.get("status") == "ok" and result.get("text_hi"):
+            if result.get("text_hi"):
                 publish_phone_alert({
                     "kind": "read",
                     "event_type": "voice_command",
@@ -898,7 +927,7 @@ class LocalLinkHandler(BaseHTTPRequestHandler):
                     "text_hi": result["text_hi"],
                     "image_jpeg_b64": result.get("image_jpeg_b64") or "",
                     "source": result.get("source"),
-                    "speak": False,
+                    "speak": result.get("status") == "ok",
                 })
             # Keep motors quiet while phone speaks; companion can resume via resume/describe-done.
             # Auto-unmute after 20s as a safety net.
@@ -1797,6 +1826,7 @@ def main():
     camera_holder["picam2"] = picam2
     if picam2 is not None:
         speak("Camera ready.")
+        reset_auto_describe_schedule(reason="camera ready")
 
     stop_event = threading.Event()
     start_local_link(stop_event)

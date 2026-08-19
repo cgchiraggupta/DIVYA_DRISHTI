@@ -21,23 +21,26 @@ from pathlib import Path
 import cv2
 
 GEMINI_ENV_FILE = Path.home() / ".divyadrishti" / "gemini.env"
-# 2026-08-14: measured live success rate on this key. "gemini-flash-latest"
-# currently resolves to gemini-3.7-flash, which was overloaded and returning
-# HTTP 503 "high demand" on ~64% of calls (4/11 ok in a 75s stress test).
-# gemini-3.6-flash scored 15/15 ok across two back-to-back test rounds with
-# the same key/network, so it's the one actually in use for now. Re-check
-# this if object naming starts silently falling back again — Google's
-# "latest" alias keeps moving to newer, more contested models.
-GEMINI_MODEL = "gemini-3.6-flash"
-# Read/describe: user is standing still waiting, can afford a longer wait.
-# gemini-3.6-flash was observed up to ~12.8s on a real call, so this needs
-# headroom above that, not just above the "usual" case.
+# 2026-08-18 live on this Pi (tiny image, thinkingLevel low):
+#   gemini-3.6-flash      23.34s
+#   gemini-3.5-flash       5.72s
+#   gemini-3.5-flash-lite  1.77s
+# 3.6 was kept earlier for 503-reliability vs "latest"/3.7, not speed.
+# 3.5-flash is the same billed key, ~4x faster, still good enough for
+# Hindi scene + OCR. Lite is faster still but weaker on small sign text —
+# do not drop to lite without a real glasses-camera OCR check.
+GEMINI_MODEL = "gemini-3.5-flash"
+# Read/describe: 3.5-flash image calls measured ~6s; 16s is ample headroom
+# and keeps a double-tap from sitting 30–40s if Gemini is already busy.
 DESCRIBE_TIMEOUT_SECONDS = 16
 # Obstacle: user is walking, but the instant TOF beep/haptic already covers
 # "something is there right now" — this timeout only gates the *name* of
 # the object, so it can afford to wait for a real answer instead of cutting
 # off a call that was about to succeed.
 OBSTACLE_TIMEOUT_SECONDS = 16
+# Manual Describe (button / phone) waits behind an in-flight auto/obstacle
+# call instead of failing instantly with status=busy.
+MANUAL_DESCRIBE_INFLIGHT_WAIT_SECONDS = 20
 DESCRIBE_COOLDOWN_SECONDS = 8
 OBSTACLE_COOLDOWN_SECONDS = 6
 # Auto scene-describe (camera-triggered, no button) gets its own, slightly
@@ -232,9 +235,11 @@ def describe_frame(frame, *, include_image: bool = True, prompt: str | None = No
             "retry_after_seconds": int(remaining + 0.999),
         })
 
-    # Non-blocking: don't wait behind another in-flight Gemini call, and
-    # don't spend this cooldown window on a request that never actually ran.
-    if not _gemini_inflight_lock.acquire(blocking=False):
+    # Wait for any in-flight auto/obstacle Gemini call to finish — a double-tap
+    # or phone Describe must not lose to status=busy in 0.00s.
+    if not _gemini_inflight_lock.acquire(
+        blocking=True, timeout=MANUAL_DESCRIBE_INFLIGHT_WAIT_SECONDS
+    ):
         return _finish("describe_frame", start, {
             "status": "busy",
             "text_hi": "",

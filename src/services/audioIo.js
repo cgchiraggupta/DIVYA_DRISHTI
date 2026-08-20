@@ -1,15 +1,13 @@
 /**
  * Where mic and speaker live right now.
  *
- * Phone Google STT + phone TTS are the stand-in until the glasses I²S
- * mic (INMP441) and speaker (MAX98357A) are verified by hardware.
+ * Phone Google STT is still the mic. Speaker is the Pi Bluetooth
+ * earbuds (Nirvana Ion A2DP) now that that path is heard working.
  * Intent mapping does not change when this flips — only capture/playback.
- *
- * Set either field to 'glasses' only after that hardware path works.
  */
 export const AUDIO_IO = {
   mic: 'phone',
-  speaker: 'phone',
+  speaker: 'glasses',
 }
 
 export function isPhoneMic() {

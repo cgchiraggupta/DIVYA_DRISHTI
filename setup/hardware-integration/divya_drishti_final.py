@@ -26,6 +26,7 @@ import speech_recognition as sr
 import requests
 from picamera2 import Picamera2
 import base64
+import tempfile
 from gemini_describe import (
     describe_frame,
     describe_obstacle,
@@ -546,10 +547,11 @@ def obstacle_phone_guidance_worker(frame, direction, distance_mm, event_type, im
             "text_hi": text_hi,
             "image_jpeg_b64": "",
             "source": result.get("source"),
-            "speak": True,
+            "speak": False,
             "replaces_alert_id": alert_id,
         }
         publish_phone_alert(payload)
+        speak(text_hi)
         queue_event(event_type, {
             "distance_mm": distance_mm,
             "direction": direction,
@@ -677,8 +679,9 @@ def _auto_describe_worker(frame, gray_candidate):
                         "text_hi": text_hi,
                         "image_jpeg_b64": result.get("image_jpeg_b64") or "",
                         "source": result.get("source"),
-                        "speak": True,
+                        "speak": False,
                     })
+                    speak(text_hi)
                     queue_event("voice_command", {
                         "command": "auto_describe",
                         "source": "glasses_auto",
@@ -927,9 +930,9 @@ class LocalLinkHandler(BaseHTTPRequestHandler):
                     "text_hi": result["text_hi"],
                     "image_jpeg_b64": result.get("image_jpeg_b64") or "",
                     "source": command,
-                    # Companion already speaks the HTTP result; don't double-TTS.
                     "speak": False,
                 })
+                speak(result["text_hi"])
             # Keep motors quiet while phone speaks; companion can resume via resume/describe-done.
             # Auto-unmute after 20s as a safety net.
             def _unmute_later():
@@ -1058,9 +1061,156 @@ def sync_worker(stop_event):
 # ══════════════════════════════════════════
 #  AUDIO
 # ══════════════════════════════════════════
-# Glasses speaker is unreliable, so the phone is the only guidance voice.
-# Flip to True only after the speaker hardware is replaced and verified.
-GLASSES_SPEAKER_ENABLED = False
+# Guidance voice is the Bluetooth earbuds on this Pi (Nirvana Ion A2DP).
+# Phone TTS is muted on these payloads so the wearer does not hear two voices.
+GLASSES_SPEAKER_ENABLED = True
+BT_SPEAKER_MAC = "90:A0:BE:CA:23:A9"
+BT_APLAY_DEV = f"bluealsa:DEV={BT_SPEAKER_MAC},PROFILE=a2dp"
+BT_SCO_DEV = f"bluealsa:DEV={BT_SPEAKER_MAC},PROFILE=sco"
+BT_HFP_SOURCE = (
+    f"/org/bluealsa/hci0/dev_{BT_SPEAKER_MAC.replace(':', '_')}/hfpag/source"
+)
+BT_HFP_SINK = (
+    f"/org/bluealsa/hci0/dev_{BT_SPEAKER_MAC.replace(':', '_')}/hfpag/sink"
+)
+BT_MIC_WAV = "/tmp/dd_bt_utterance.wav"
+SARVAM_ENV_FILE = CONFIG_DIR / "sarvam.env"
+SARVAM_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_SPEAKER = "priya"
+SARVAM_TIMEOUT_SECONDS = 6
+_bt_play_lock = threading.Lock()
+
+
+def _load_sarvam_key():
+    key = (os.environ.get("SARVAM_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        for line in SARVAM_ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("SARVAM_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _sarvam_lang_for(text):
+    return "hi-IN" if any("\u0900" <= ch <= "\u097F" for ch in text) else "en-IN"
+
+
+def _fetch_sarvam_wav(text):
+    key = _load_sarvam_key()
+    if not key:
+        return None
+    try:
+        response = requests.post(
+            SARVAM_URL,
+            headers={
+                "api-subscription-key": key,
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": text.strip()[:2500],
+                "target_language_code": _sarvam_lang_for(text),
+                "speaker": SARVAM_SPEAKER,
+                "model": "bulbul:v3",
+                "pace": 0.95,
+            },
+            timeout=SARVAM_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            print(f"[AUDIO] Sarvam HTTP {response.status_code}")
+            return None
+        audio_b64 = (response.json().get("audios") or [None])[0]
+        if not audio_b64:
+            print("[AUDIO] Sarvam returned no audio")
+            return None
+        return base64.b64decode(audio_b64)
+    except Exception as error:
+        print(f"[AUDIO] Sarvam failed: {type(error).__name__}")
+        return None
+
+
+def _ensure_bt_speaker():
+    try:
+        listed = subprocess.check_output(
+            ["bluealsa-cli", "list-pcms"],
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            text=True,
+        )
+        if BT_SPEAKER_MAC.replace(":", "_") in listed:
+            return
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["bluetoothctl", "connect", BT_SPEAKER_MAC],
+            timeout=6,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception as error:
+        print(f"[AUDIO] BT connect skipped: {error}")
+
+
+def _espeak_voice_for(text):
+    return "hi" if any("\u0900" <= ch <= "\u097F" for ch in text) else "en"
+
+
+def _play_espeak_bt(text, volume=None):
+    voice = _espeak_voice_for(text)
+    args = ["espeak", "-s", "140", "-v", voice, "--stdout", text]
+    if volume is not None:
+        args[1:1] = ["-a", str(max(20, min(200, int(volume))))]
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.call(
+        ["aplay", "-q", "-D", BT_APLAY_DEV],
+        stdin=proc.stdout,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()
+
+
+def _play_bt_speaker(text, blocking=False, volume=None):
+    if not text or not GLASSES_SPEAKER_ENABLED:
+        return
+
+    def run():
+        with _bt_play_lock:
+            _ensure_bt_speaker()
+            wav = _fetch_sarvam_wav(text)
+            if wav:
+                print("[AUDIO] playing Sarvam")
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+                        tmp.write(wav)
+                        tmp.flush()
+                        subprocess.call(
+                            ["aplay", "-q", "-D", BT_APLAY_DEV, tmp.name],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    return
+                except Exception as error:
+                    print(f"[AUDIO] Sarvam playback failed: {type(error).__name__}")
+            print("[AUDIO] fallback espeak")
+            try:
+                _play_espeak_bt(text, volume)
+            except Exception as error:
+                print(f"[AUDIO] BT playback failed: {error}")
+
+    if blocking:
+        run()
+    else:
+        threading.Thread(target=run, daemon=True).start()
 
 
 def speak(text, blocking=False, volume=None):
@@ -1075,21 +1225,11 @@ def speak(text, blocking=False, volume=None):
             "text_hi": text,
             "image_jpeg_b64": "",
             "source": "glasses_voice",
-            "speak": True,
+            "speak": False,
         })
     except Exception as error:
         print(f"[AUDIO] Could not hand speech to the phone: {error}")
-    if not GLASSES_SPEAKER_ENABLED:
-        return
-    env = {**os.environ, "AUDIODEV": "plughw:0,0"}
-    args = ["espeak", "-s", "140", "-v", "en", text]
-    if volume is not None:
-        args[1:1] = ["-a", str(max(20, min(100, int(volume))))]
-    kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-    if blocking:
-        subprocess.call(args, **kwargs)
-    else:
-        subprocess.Popen(args, **kwargs)
+    _play_bt_speaker(text, blocking=blocking, volume=volume)
 
 # ══════════════════════════════════════════
 #  VIBRATION (dual motor, directional)
@@ -1591,9 +1731,10 @@ def detection_loop(picam2, tof1, tof2, stop_event):
                         "text_hi": quick_hi,
                         "image_jpeg_b64": "",
                         "source": "tof_snapshot",
-                        # Phone TTS is primary while glasses speaker is unreliable.
-                        "speak": speak_now,
+                        "speak": False,
                     })
+                    if speak_now:
+                        speak(quick_hi)
                     # Opening warning: two distinct buzzes, haptic only on glasses.
                     deliver_haptic_burst(side, pattern, HAPTIC_OPENING_BURST_COUNT)
                     queue_event(event_type, event_detail)
@@ -1685,106 +1826,189 @@ def detection_loop(picam2, tof1, tof2, stop_event):
 
 # ══════════════════════════════════════════
 #  VOICE COMMAND LOOP (main thread)
+#  Earbud Hands-Free mic (HFP SCO) → Google STT → same intents as the phone.
+#  Replies go out Sarvam on A2DP. Phone mic stays available in the app.
 # ══════════════════════════════════════════
-def voice_loop(picam2, stop_event):
-    print("[MIC] Voice loop started.")
-    print("[MIC] Commands: 'what is ahead', 'pause', 'resume', "
-          "'photo', 'status', 'pairing code', 'help', 'stop'")
+def _ensure_bt_mic():
+    _ensure_bt_speaker()
+    for pcm in (BT_HFP_SOURCE, BT_HFP_SINK):
+        try:
+            subprocess.run(
+                ["bluealsa-cli", "codec", pcm, "CVSD"],
+                timeout=3,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
 
-    r = sr.Recognizer()
-    r.energy_threshold = 300
-    r.dynamic_energy_threshold = True
+
+def _wav_peak(path):
+    try:
+        import wave
+        import array
+        with wave.open(path, "rb") as handle:
+            frames = handle.readframes(handle.getnframes())
+        if len(frames) < 4:
+            return 0
+        samples = array.array("h", frames[: len(frames) - (len(frames) % 2)])
+        return max(abs(sample) for sample in samples) if samples else 0
+    except Exception:
+        return 0
+
+
+def _record_bt_utterance(seconds=4):
+    _ensure_bt_mic()
+    try:
+        os.remove(BT_MIC_WAV)
+    except OSError:
+        pass
+    result = subprocess.run(
+        [
+            "timeout", "6",
+            "arecord", "-q",
+            "-D", BT_SCO_DEV,
+            "-f", "S16_LE", "-c", "1", "-r", "8000",
+            "-d", str(int(seconds)),
+            BT_MIC_WAV,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode not in (0, 124):
+        return None
+    if not os.path.exists(BT_MIC_WAV) or _wav_peak(BT_MIC_WAV) < 800:
+        return None
+    return BT_MIC_WAV
+
+
+def _transcribe_bt_wav(path):
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(path) as source:
+        audio = recognizer.record(source)
+    for language in ("hi-IN", "en-IN"):
+        try:
+            return recognizer.recognize_google(audio, language=language)
+        except sr.UnknownValueError:
+            continue
+        except sr.RequestError as error:
+            print(f"[MIC] STT error: {type(error).__name__}")
+            return None
+    return None
+
+
+def _normalize_voice(text):
+    lowered = (text or "").lower()
+    for mark in ("।", ".", "?", "!", ",", ":", ";"):
+        lowered = lowered.replace(mark, " ")
+    return " ".join(lowered.split())
+
+
+def _match_earbud_intent(text):
+    blob = _normalize_voice(text)
+    if not blob:
+        return "empty"
+    checks = (
+        ("help", ("मदद", "help", "commands", "कमांड", "what can you do")),
+        ("read", ("पढ़ो", "पढो", "पढ़ कर", "क्या लिखा", "read", "ocr")),
+        ("describe", (
+            "आगे क्या", "सामने क्या", "क्या दिख", "बताओ आगे", "देखो आगे",
+            "what is ahead", "what's ahead", "whats ahead", "describe", "look ahead",
+        )),
+        ("distance", ("कितनी दूर", "कितना पास", "दूरी", "how far", "how close", "distance")),
+        ("pause", ("सेंसिंग बंद", "अलर्ट बंद", "रुक जाओ", "बंद करो", "pause")),
+        ("resume", ("सेंसिंग चालू", "शुरू करो", "चालू करो", "resume", "start sensing")),
+        ("repeat", ("फिर से बोलो", "दोबारा", "repeat", "say again")),
+        ("stop_speech", ("मत बोलो", "चुप", "stop talking", "be quiet")),
+    )
+    for intent, phrases in checks:
+        if any(phrase in blob for phrase in phrases):
+            return intent
+    return "unknown"
+
+
+def _latest_distance_mm():
+    with tof_sample_lock:
+        left = tof_samples["left"]["value"]
+        right = tof_samples["right"]["value"]
+    values = [value for value in (left, right) if value is not None]
+    return min(values) if values else None
+
+
+def _run_earbud_intent(intent, picam2):
+    if intent == "describe" or intent == "read":
+        if picam2 is None:
+            speak("कैमरा उपलब्ध नहीं है।", blocking=True)
+            return
+        mode = "read" if intent == "read" else "describe"
+        speak("देख रही हूँ।" if mode == "describe" else "पढ़ रही हूँ।", blocking=True)
+        try:
+            with camera_lock:
+                frame = picam2.capture_array()
+            result = describe_frame(frame, include_image=True, mode=mode)
+        except Exception as error:
+            print(f"[MIC] {mode} failed: {error}")
+            speak("अभी बता नहीं पाए।", blocking=True)
+            return
+        text_hi = (result.get("text_hi") or "").strip()
+        speak(text_hi or "अभी बता नहीं पाए।", blocking=True)
+        return
+    if intent == "distance":
+        distance_mm = _latest_distance_mm()
+        if distance_mm is None:
+            speak("अभी दूरी नहीं मिली।", blocking=True)
+        elif distance_mm < 1000:
+            speak(f"आगे लगभग {max(1, int(round(distance_mm / 10.0)))} सेंटीमीटर है।", blocking=True)
+        else:
+            speak(f"आगे लगभग {distance_mm / 1000.0:.1f} मीटर है।", blocking=True)
+        return
+    if intent == "pause":
+        with state_lock:
+            state["paused"] = True
+        speak("सेंसिंग बंद है।", blocking=True)
+        return
+    if intent == "resume":
+        with state_lock:
+            state["paused"] = False
+            state["haptics_muted"] = False
+        speak("सेंसिंग चालू है।", blocking=True)
+        return
+    if intent == "help":
+        speak("कहिए: आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, शुरू करो।", blocking=True)
+        return
+    if intent == "repeat":
+        speak("अभी दोहराने के लिए कुछ नहीं है।", blocking=True)
+        return
+    if intent == "stop_speech":
+        return
+    speak("समझ नहीं आई। कहिए आगे क्या है, पढ़ो, या मदद।", blocking=True)
+
+
+def voice_loop(picam2, stop_event):
+    print("[MIC] Voice loop on Nirvana Ion HFP mic.")
+    print("[MIC] Say: आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, शुरू करो")
+    time.sleep(1.0)
 
     while not stop_event.is_set():
         try:
-            with sr.Microphone() as source:
-                r.adjust_for_ambient_noise(source, duration=0.5)
-                audio = r.listen(source, timeout=4, phrase_time_limit=5)
-
-            text = r.recognize_google(audio).lower()
-            print(f"[MIC] Heard: '{text}'")
-
-            if "what" in text or "ahead" in text or "around" in text:
-                with state_lock:
-                    scene = state["last_scene"]
-                speak(f"Currently: {scene}", blocking=True)
-                vibrate("both", 0.2, 60)
-                queue_event("voice_command", {
-                    "command": text,
-                    "response": f"Currently: {scene}",
-                })
-
-            elif "pause" in text:
-                with state_lock:
-                    state["paused"] = True
-                speak("Detection paused", blocking=True)
-
-            elif "resume" in text or "start" in text:
-                with state_lock:
-                    state["paused"] = False
-                speak("Detection resumed", blocking=True)
-
-            elif "photo" in text or "capture" in text or "picture" in text:
-                if picam2 is None:
-                    speak("Camera is unavailable", blocking=True)
-                else:
-                    fname = f"photo_{int(time.time())}.jpg"
-                    with camera_lock:
-                        frame = picam2.capture_array()
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(fname, frame_bgr)
-                    speak("Photo saved", blocking=True)
-                    print(f"[CAMERA] Saved {fname}")
-
-            elif "status" in text or "check" in text:
-                with state_lock:
-                    fc = state["frame_count"]
-                    scene = state["last_scene"]
-                    paused = state["paused"]
-                    tof_ok = state["tof_ok"]
-                mode = "ToF sensors active" if tof_ok else "camera-only mode"
-                status = "paused" if paused else "running"
-                speak(
-                    f"System {status}, {mode}. "
-                    f"{fc} frames processed. {scene}",
-                    blocking=True
-                )
-                queue_event("voice_command", {
-                    "command": text,
-                    "response": f"System {status}, {mode}. {scene}",
-                })
-
-            elif "pairing code" in text or text.strip() == "code":
-                with state_lock:
-                    code = state["pairing_code"]
-                if code:
-                    speak_pairing_code(code)
-                else:
-                    speak("A pairing code is not available", blocking=True)
-
-            elif "help" in text or "commands" in text:
-                speak(
-                    "Commands: what is ahead, pause, resume, "
-                    "photo, status, stop",
-                    blocking=True
-                )
-
-            elif "stop" in text or "exit" in text or "shutdown" in text:
-                speak("Shutting down Divya Drishti", blocking=True)
-                vibrate_pattern("both", "double")
-                stop_event.set()
-
-            else:
-                speak("Command not recognized")
-
-        except sr.WaitTimeoutError:
-            pass
-        except sr.UnknownValueError:
-            pass
-        except sr.RequestError as e:
-            print(f"[MIC] API error: {e}")
-        except Exception as e:
-            print(f"[MIC] Error: {e}")
+            wav_path = _record_bt_utterance(4)
+            if not wav_path:
+                continue
+            time.sleep(0.35)
+            heard = _transcribe_bt_wav(wav_path)
+            if not heard:
+                continue
+            print(f"[MIC] Heard: '{heard}'")
+            intent = _match_earbud_intent(heard)
+            print(f"[MIC] Intent: {intent}")
+            if intent == "empty":
+                continue
+            _run_earbud_intent(intent, picam2)
+            queue_event("voice_command", {"command": heard, "intent": intent, "source": "earbud"})
+        except Exception as error:
+            print(f"[MIC] Error: {type(error).__name__}")
+            time.sleep(0.5)
 
 # ══════════════════════════════════════════
 #  STARTUP SEQUENCE

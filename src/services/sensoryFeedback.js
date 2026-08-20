@@ -2,6 +2,7 @@ import { Capacitor } from '@capacitor/core'
 import { Haptics, ImpactStyle } from '@capacitor/haptics'
 import { TextToSpeech } from '@capacitor-community/text-to-speech'
 import { isSarvamConfigured, speakWithSarvam, stopSarvamAudio } from './sarvamTts'
+import { isPhoneSpeaker } from './audioIo'
 
 let lastSpokenText = ''
 
@@ -63,6 +64,8 @@ export async function stopSpeech() {
 export async function speakGuidance(text, volume = 1, { fast = false } = {}) {
   if (!text) return
   lastSpokenText = text
+  // Glasses Bluetooth earbuds are the walk speaker; do not also play here.
+  if (!isPhoneSpeaker()) return
 
   if (fast) {
     try {

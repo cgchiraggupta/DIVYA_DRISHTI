@@ -1079,6 +1079,8 @@ SARVAM_URL = "https://api.sarvam.ai/text-to-speech"
 SARVAM_SPEAKER = "priya"
 SARVAM_TIMEOUT_SECONDS = 6
 _bt_play_lock = threading.Lock()
+_bt_record_proc_lock = threading.Lock()
+_bt_record_proc = None
 
 
 def _load_sarvam_key():
@@ -1179,12 +1181,35 @@ def _play_espeak_bt(text, volume=None):
     proc.wait()
 
 
+def _interrupt_bt_record():
+    """Stop HFP capture so A2DP TTS can use the same earbuds."""
+    global _bt_record_proc
+    with _bt_record_proc_lock:
+        proc = _bt_record_proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            return
+    try:
+        proc.wait(timeout=0.6)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=0.3)
+        except Exception:
+            pass
+
+
 def _play_bt_speaker(text, blocking=False, volume=None):
     if not text or not GLASSES_SPEAKER_ENABLED:
         return
 
     def run():
+        _interrupt_bt_record()
         with _bt_play_lock:
+            time.sleep(0.15)
             _ensure_bt_speaker()
             wav = _fetch_sarvam_wav(text)
             if wav:
@@ -1193,12 +1218,16 @@ def _play_bt_speaker(text, blocking=False, volume=None):
                     with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
                         tmp.write(wav)
                         tmp.flush()
-                        subprocess.call(
+                        rc = subprocess.call(
                             ["aplay", "-q", "-D", BT_APLAY_DEV, tmp.name],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                         )
-                    return
+                    if rc != 0:
+                        print(f"[AUDIO] aplay rc={rc}")
+                    else:
+                        time.sleep(0.2)
+                        return
                 except Exception as error:
                     print(f"[AUDIO] Sarvam playback failed: {type(error).__name__}")
             print("[AUDIO] fallback espeak")
@@ -1206,6 +1235,7 @@ def _play_bt_speaker(text, blocking=False, volume=None):
                 _play_espeak_bt(text, volume)
             except Exception as error:
                 print(f"[AUDIO] BT playback failed: {error}")
+            time.sleep(0.2)
 
     if blocking:
         run()
@@ -1827,7 +1857,8 @@ def detection_loop(picam2, tof1, tof2, stop_event):
 # ══════════════════════════════════════════
 #  VOICE COMMAND LOOP (main thread)
 #  Earbud Hands-Free mic (HFP SCO) → Google STT → same intents as the phone.
-#  Replies go out Sarvam on A2DP. Phone mic stays available in the app.
+#  Always-on HFP stays connected, but commands require Hey Divya / हे दिव्या.
+#  Unknown/ambient speech stays silent. Replies go out Sarvam on A2DP.
 # ══════════════════════════════════════════
 def _ensure_bt_mic():
     _ensure_bt_speaker()
@@ -1859,28 +1890,40 @@ def _wav_peak(path):
 
 
 def _record_bt_utterance(seconds=4):
-    _ensure_bt_mic()
+    global _bt_record_proc
     try:
         os.remove(BT_MIC_WAV)
     except OSError:
         pass
-    result = subprocess.run(
-        [
-            "timeout", "6",
-            "arecord", "-q",
-            "-D", BT_SCO_DEV,
-            "-f", "S16_LE", "-c", "1", "-r", "8000",
-            "-d", str(int(seconds)),
-            BT_MIC_WAV,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if result.returncode not in (0, 124):
-        return None
-    if not os.path.exists(BT_MIC_WAV) or _wav_peak(BT_MIC_WAV) < 800:
-        return None
-    return BT_MIC_WAV
+    with _bt_play_lock:
+        _ensure_bt_mic()
+        proc = subprocess.Popen(
+            [
+                "arecord", "-q",
+                "-D", BT_SCO_DEV,
+                "-f", "S16_LE", "-c", "1", "-r", "8000",
+                "-d", str(int(seconds)),
+                BT_MIC_WAV,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with _bt_record_proc_lock:
+            _bt_record_proc = proc
+        try:
+            proc.wait(timeout=int(seconds) + 2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        finally:
+            with _bt_record_proc_lock:
+                if _bt_record_proc is proc:
+                    _bt_record_proc = None
+        if proc.returncode != 0:
+            return None
+        if not os.path.exists(BT_MIC_WAV) or _wav_peak(BT_MIC_WAV) < 800:
+            return None
+        return BT_MIC_WAV
 
 
 def _transcribe_bt_wav(path):
@@ -1898,17 +1941,61 @@ def _transcribe_bt_wav(path):
     return None
 
 
+WAKE_PHRASES = (
+    "hey divya drishti",
+    "ok divya drishti",
+    "हे दिव्या दृष्टि",
+    "हे दिव्य दृष्टि",
+    "हे डिव्या दृष्टि",
+    "hey divya dristi",
+    "hey divyadrishti",
+    "divya drishti",
+    "divya dristi",
+    "दिव्या दृष्टि",
+    "दिव्य दृष्टि",
+    "दिव्या द्रिष्टी",
+    "hey divya",
+    "ok divya",
+    "ओके दिव्या",
+    "हे दिव्या",
+    "हे दिव्य",
+    "हे डिव्या",
+    "ए दिव्या",
+    "दिव्या",
+)
+
+
 def _normalize_voice(text):
     lowered = (text or "").lower()
-    for mark in ("।", ".", "?", "!", ",", ":", ";"):
+    for mark in ("'", "’", "।", ".", "?", "!", ",", ":", ";", "“", "”"):
         lowered = lowered.replace(mark, " ")
     return " ".join(lowered.split())
 
 
+def _strip_wake_phrase(text):
+    normalized = _normalize_voice(text)
+    if not normalized:
+        return "", False
+    for wake in sorted(WAKE_PHRASES, key=len, reverse=True):
+        if normalized == wake:
+            return "", True
+        if normalized.startswith(wake + " "):
+            return normalized[len(wake):].strip(), True
+    compact = normalized.replace(" ", "")
+    for wake in sorted(WAKE_PHRASES, key=len, reverse=True):
+        compact_wake = wake.replace(" ", "")
+        if compact == compact_wake:
+            return "", True
+        if len(compact_wake) >= 6 and compact.startswith(compact_wake):
+            remainder = normalized.replace(wake, " ").strip() if wake in normalized else compact[len(compact_wake):]
+            return remainder, True
+    return normalized, False
+
+
 def _match_earbud_intent(text):
-    blob = _normalize_voice(text)
-    if not blob:
-        return "empty"
+    remainder, had_wake = _strip_wake_phrase(text)
+    if not remainder:
+        return ("await_command" if had_wake else "empty", had_wake)
     checks = (
         ("help", ("मदद", "help", "commands", "कमांड", "what can you do")),
         ("read", ("पढ़ो", "पढो", "पढ़ कर", "क्या लिखा", "read", "ocr")),
@@ -1923,9 +2010,9 @@ def _match_earbud_intent(text):
         ("stop_speech", ("मत बोलो", "चुप", "stop talking", "be quiet")),
     )
     for intent, phrases in checks:
-        if any(phrase in blob for phrase in phrases):
-            return intent
-    return "unknown"
+        if any(phrase in remainder for phrase in phrases):
+            return intent, had_wake
+    return "unknown", had_wake
 
 
 def _latest_distance_mm():
@@ -1975,37 +2062,53 @@ def _run_earbud_intent(intent, picam2):
         speak("सेंसिंग चालू है।", blocking=True)
         return
     if intent == "help":
-        speak("कहिए: आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, शुरू करो।", blocking=True)
+        speak("पहले हे दिव्या कहिए, फिर आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, या शुरू करो।", blocking=True)
         return
     if intent == "repeat":
         speak("अभी दोहराने के लिए कुछ नहीं है।", blocking=True)
         return
     if intent == "stop_speech":
         return
-    speak("समझ नहीं आई। कहिए आगे क्या है, पढ़ो, या मदद।", blocking=True)
+    # Unknown / ambient speech: stay silent. Do not prompt for पढ़ो.
 
 
 def voice_loop(picam2, stop_event):
     print("[MIC] Voice loop on Nirvana Ion HFP mic.")
-    print("[MIC] Say: आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, शुरू करो")
+    print("[MIC] Wake: हे दिव्या / Hey Divya. Then: आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, शुरू करो")
     time.sleep(1.0)
+    require_wake = True
 
     while not stop_event.is_set():
         try:
             wav_path = _record_bt_utterance(4)
             if not wav_path:
+                if not require_wake:
+                    require_wake = True
                 continue
             time.sleep(0.35)
             heard = _transcribe_bt_wav(wav_path)
             if not heard:
+                if not require_wake:
+                    require_wake = True
                 continue
             print(f"[MIC] Heard: '{heard}'")
-            intent = _match_earbud_intent(heard)
-            print(f"[MIC] Intent: {intent}")
-            if intent == "empty":
+            intent, had_wake = _match_earbud_intent(heard)
+            print(f"[MIC] Intent: {intent} wake={had_wake} gated={require_wake}")
+            if require_wake and not had_wake and intent != "await_command":
+                print("[MIC] Ignored (no wake word)")
+                continue
+            if intent in ("empty", "unknown"):
+                require_wake = True
+                continue
+            if intent == "await_command":
+                speak("कहिए।", blocking=True)
+                time.sleep(0.4)
+                require_wake = False
                 continue
             _run_earbud_intent(intent, picam2)
             queue_event("voice_command", {"command": heard, "intent": intent, "source": "earbud"})
+            time.sleep(0.4)
+            require_wake = True
         except Exception as error:
             print(f"[MIC] Error: {type(error).__name__}")
             time.sleep(0.5)

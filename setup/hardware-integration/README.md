@@ -12,6 +12,9 @@ product features rather than optional future ideas.
    history, settings, and commands. The app must not depend on a permanent Bluetooth connection.
 3. The physical device displays or speaks a pairing code; the app claims that device after the user
    enters or scans the code.
+4. **Wearer earbuds** are a separate Classic Bluetooth link on the Pi (not the phone). One
+   remembered headset, auto-connect when the case opens. Not every consumer bud works — see
+   [BLUETOOTH_EARBUDS.md](BLUETOOTH_EARBUDS.md).
 
 ## Wi-Fi setup
 

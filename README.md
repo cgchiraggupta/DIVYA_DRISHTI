@@ -62,7 +62,9 @@ also used for the nearby same-Wi-Fi link between the phone and the glasses.
 Each physical device is expected to insert its own row into `devices` on first boot
 (with a pairing code). The app stores that code on the phone after pairing. The Pi script also
 provides a nearby same-Wi-Fi status endpoint on port `8765`; its setup-only test service lives in
-`setup/hardware-integration/divyadrishti_local_link.py`.
+`setup/hardware-integration/divyadrishti_local_link.py`. Wearer hearing on the prototype is
+Bluetooth earbuds on the Pi, not the phone — see
+`setup/hardware-integration/BLUETOOTH_EARBUDS.md`.
 
 ## Project structure
 

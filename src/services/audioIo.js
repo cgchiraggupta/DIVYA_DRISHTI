@@ -1,13 +1,13 @@
 /**
  * Where mic and speaker live right now.
  *
- * Phone Google STT is still the mic. Speaker is the Pi Bluetooth
- * earbuds (Nirvana Ion A2DP) now that that path is heard working.
- * Intent mapping does not change when this flips — only capture/playback.
+ * Both on the phone -- the Pi has no mic or speaker of its own. Earbuds
+ * pair to the phone directly (normal Bluetooth headset pairing); the OS
+ * routes phone STT/TTS through them once connected.
  */
 export const AUDIO_IO = {
   mic: 'phone',
-  speaker: 'glasses',
+  speaker: 'phone',
 }
 
 export function isPhoneMic() {

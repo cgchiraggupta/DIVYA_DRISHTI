@@ -1,6 +1,6 @@
 /**
  * Capture one spoken utterance from the phone mic (Google / Android STT).
- * Glasses I²S capture is not used until AUDIO_IO.mic flips to 'glasses'.
+ * The Pi has no mic of its own -- this is the only capture path.
  */
 import { Capacitor } from '@capacitor/core'
 import { SpeechRecognition } from '@capgo/capacitor-speech-recognition'
@@ -100,6 +100,31 @@ export async function listenForSpeech() {
     ? result.matches.map((item) => String(item || '').trim()).filter(Boolean)
     : []
   return matches
+}
+
+/**
+ * Read-only permission check for Diagnostics -- never prompts. The Pi has no
+ * mic of its own, so this is the microphone that actually matters for voice
+ * commands. Returns true/false, or null when the platform can't report it.
+ */
+export async function checkMicPermission() {
+  if (Capacitor.isNativePlatform()) {
+    try {
+      const current = await SpeechRecognition.checkPermissions()
+      return current.speechRecognition === 'granted'
+    } catch {
+      return null
+    }
+  }
+  if (navigator.permissions?.query) {
+    try {
+      const status = await navigator.permissions.query({ name: 'microphone' })
+      return status.state === 'granted'
+    } catch {
+      return null
+    }
+  }
+  return null
 }
 
 export async function stopListening() {

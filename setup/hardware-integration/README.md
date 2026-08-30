@@ -6,15 +6,17 @@ product features rather than optional future ideas.
 
 ## Connection model
 
-1. **Bluetooth Low Energy (BLE)** handles nearby-device discovery, first-time pairing, and secure
-   Wi-Fi provisioning.
+1. **Bluetooth Low Energy (BLE)** handles nearby-device discovery, first-time pairing, secure
+   Wi-Fi provisioning, and exposing the pairing code (see below) — the Pi has no speaker, so this
+   is the only way the phone learns it.
 2. **Wi-Fi + Supabase** handles normal day-to-day communication: live device status, alerts,
    history, settings, and commands. The app must not depend on a permanent Bluetooth connection.
-3. The physical device displays or speaks a pairing code; the app claims that device after the user
-   enters or scans the code.
-4. **Wearer earbuds** are a separate Classic Bluetooth link on the Pi (not the phone). One
-   remembered headset, auto-connect when the case opens. Not every consumer bud works — see
-   [BLUETOOTH_EARBUDS.md](BLUETOOTH_EARBUDS.md).
+3. The physical device advertises its pairing code over a BLE characteristic (`PairingCodeCharacteristic`
+   in `divyadrishti-ble-provisioner.py`); the app reads it during the same BLE step used for Wi-Fi
+   setup and claims that device.
+4. **Wearer earbuds pair to the phone**, not the Pi — the Pi has no microphone or speaker of its
+   own. All voice input, speech-to-text, and spoken output happen on the phone; the Pi is sensing
+   and haptic hardware only (two vibrators, one buzzer, one camera, one button).
 
 ## Wi-Fi setup
 
@@ -36,6 +38,50 @@ The Pi will publish the following to Supabase after it is connected:
 The app will send settings and commands through an authenticated command channel. The exact
 `device_commands` schema and Pi polling/acknowledgement behavior will be added when the hardware
 team confirms its preferred transport.
+
+## Local companion link (same Wi-Fi)
+
+`divya_drishti_final.py` also runs a same-Wi-Fi link for the phone, gated by the pairing code
+(`X-Divya-Pairing-Code` header, or a `code` query param for the socket — plain WebSocket clients
+can't set custom headers on the handshake). This is in addition to, not instead of, the Supabase
+path above; Supabase stays the durable/away-from-home source of truth.
+
+- **HTTP, port 8765** (`LocalLinkHandler`) — request/response: `GET /v1/health`, `GET /v1/status`,
+  `GET /v1/settings`, `POST /v1/settings`, `POST /v1/command`. Also used locally by
+  `divyadrishti_control_button.py` (the button POSTs `{"command": "wake"}` on a single click and
+  `{"command": "describe"}` on a double click — the Pi never processes either itself, both just
+  become a request to the phone; see below).
+- **WebSocket, port 8766** (`ws_handler`/`start_ws_link`) — push-based: the Pi sends
+  `{"type": "status", ...}` on every status change, `{"type": "alert", ...}` the instant an
+  obstacle/describe/read alert is queued, and `{"type": "wake_requested"}` on a single button
+  click (telling the phone to start listening — see below), instead of the phone polling. The
+  client can also send `{"type": "get_status"}`, `{"type": "update_settings", "payload": {...}}`,
+  or `{"type": "command", "payload": {"command": "..."}}`, each echoing a `request_id` in the
+  reply. Requires `pip3 install --user websockets` on the Pi, then
+  `sudo systemctl restart divyadrishti-sensing.service`.
+
+## The Pi has no mic, no speaker, and no Gemini key — the phone does all of it
+
+The Pi is sensing + haptic hardware only: two vibrators, one buzzer, one camera, one button. It
+never calls Gemini and never speaks. Whenever it needs a photo processed — the button's single
+click (`wake_requested`, see above) leads to the phone listening and asking for a command; the
+button's double click, near-obstacle naming, and the periodic ambient scene description all
+capture a photo and send it to the *connected phone* as a `vision_request` over the WebSocket link
+(`request_phone_vision()` in `divya_drishti_final.py`) instead of calling Gemini itself. The phone
+runs it through the `gemini-vision` Supabase Edge Function (`supabase/functions/gemini-vision/index.ts`,
+modes `describe`/`read`/`read_full`/`obstacle`), which holds the real Gemini key server-side so it
+never ships inside the app, then speaks the result itself and replies `vision_result` over the
+socket. If no phone is connected, or it doesn't reply within `PHONE_VISION_TIMEOUT_S`/
+`PHONE_VISION_FULL_TIMEOUT_S`, that request simply fails — there is no local fallback; buzzer and
+vibration motors are unaffected either way since they never depend on any of this.
+
+Deploy the Edge Function (needs the Supabase CLI logged into the project):
+```bash
+supabase functions deploy gemini-vision
+supabase secrets set GEMINI_API_KEY=your-key-here
+```
+The Edge Function's prompts are the only copy of `DESCRIBE_PROMPT`/`OCR_PROMPT`/`OCR_FULL_PROMPT`/
+`OBSTACLE_PROMPT` — the Pi no longer has its own copies to keep in sync.
 
 ## Automatic sensing startup
 

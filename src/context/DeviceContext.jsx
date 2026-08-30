@@ -2,13 +2,32 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { supabase, isDemoMode } from '../lib/supabaseClient'
 import { createDemoEvent, demoDevice, demoEvents, demoStatus, sceneSpeakText } from '../lib/demoData'
 import { signalGuidance, speakGuidance } from '../services/sensoryFeedback'
-import { getNearbyDeviceStatus, sendNearbyCommand, sendNearbyDescribe, sendNearbyRead, clearNearbyDeviceUrlCache } from '../services/localDeviceLink'
+import { sendNearbyCommand, sendNearbyDescribe, sendNearbyRead } from '../services/localDeviceLink'
+import { connectLocalSocket, disconnectLocalSocket, isLocalSocketConnected, sendLocalCommand } from '../services/localSocketLink'
+import { describeForGlasses } from '../services/glassesVision'
 import { loadObstacleHistory, saveObstacleHistoryItem } from '../services/obstacleHistory'
 import { startBackgroundGuardian, stopBackgroundGuardian } from '../services/backgroundGuardian'
 
 const DeviceContext = createContext(undefined)
 const PAIRING_CODE_KEY = 'divya-drishti-pairing-code'
 const LAST_PHONE_ALERT_KEY = 'divyadrishti-last-phone-alert-id'
+
+/**
+ * Send a companion command over the push socket when it's open (instant,
+ * no per-call HTTP round trip); otherwise fall back to the existing HTTP
+ * link. The Pi answers both transports from the same handler, so the
+ * response shape is identical either way.
+ */
+async function withLocalSocket(command, httpFallback) {
+  if (isLocalSocketConnected()) {
+    try {
+      return await sendLocalCommand(command)
+    } catch {
+      // Socket call failed in flight — fall back to HTTP below.
+    }
+  }
+  return httpFallback()
+}
 
 /**
  * Short two-tone cue before an auto-describe speaks. This speech was not
@@ -57,6 +76,7 @@ export function DeviceProvider({ children }) {
   const [dataError, setDataError] = useState(null)
   const [lastRefreshedAt, setLastRefreshedAt] = useState(null)
   const [obstacleHistory, setObstacleHistory] = useState(() => loadObstacleHistory())
+  const [wakeRequestedAt, setWakeRequestedAt] = useState(0)
   const speakingAlertRef = useRef(false)
 
   /**
@@ -302,31 +322,52 @@ export function DeviceProvider({ children }) {
       if (isAutoDescribe) await playAutoDescribeCue()
       await speakAlertOnce(speakText)
       if (device?.pairing_code) {
-        await sendNearbyCommand(device.pairing_code, 'unmute_haptics').catch(() => {})
+        await withLocalSocket('unmute_haptics', () => sendNearbyCommand(device.pairing_code, 'unmute_haptics')).catch(() => {})
       }
     }
 
-    const checkNearby = async () => {
-      try {
-        const localStatus = await getNearbyDeviceStatus(nearbyPairingCode)
-        if (!active) return
-        setNearbyLink({ state: 'connected', status: localStatus })
-        const alerts = Array.isArray(localStatus?.phone_alerts) && localStatus.phone_alerts.length
-          ? localStatus.phone_alerts
-          : (localStatus?.phone_alert ? [localStatus.phone_alert] : [])
-        for (const alert of alerts) {
-          await handlePhoneAlert(alert)
-        }
-      } catch {
-        clearNearbyDeviceUrlCache()
-        if (active) setNearbyLink({ state: 'away', status: null })
+    // The Pi pushes a fresh status the instant it changes, and pushes each
+    // obstacle/describe/read alert separately as it's queued — no polling.
+    const onNearbyStatus = (localStatus) => {
+      if (!active) return
+      setNearbyLink({ state: 'connected', status: localStatus })
+      const alerts = Array.isArray(localStatus?.phone_alerts) && localStatus.phone_alerts.length
+        ? localStatus.phone_alerts
+        : (localStatus?.phone_alert ? [localStatus.phone_alert] : [])
+      for (const alert of alerts) {
+        handlePhoneAlert(alert)
       }
     }
-    checkNearby()
-    const interval = window.setInterval(checkNearby, 1_000)
+    const onNearbyAlert = (alert) => {
+      if (active) handlePhoneAlert(alert)
+    }
+    const onNearbyClose = () => {
+      if (active) setNearbyLink({ state: 'away', status: null })
+    }
+    // The Pi has no Gemini key of its own — this phone always runs it, via
+    // glassesVision.js. The Pi never speaks either, so this is also the
+    // only place that speaks the answer for a button-triggered or ambient
+    // (obstacle/auto-describe) request; the phone's own UI/voice-triggered
+    // describe/read already gets its text back through the normal
+    // command round trip and must not speak it a second time here.
+    const onVisionRequest = async (payload) => {
+      const result = await describeForGlasses(nearbyPairingCode, payload)
+      if (active && result?.text_hi) await speakAlertOnce(result.text_hi)
+      return result
+    }
+    const onWakeRequested = () => {
+      if (active) setWakeRequestedAt(Date.now())
+    }
+    connectLocalSocket(nearbyPairingCode, {
+      onStatus: onNearbyStatus,
+      onAlert: onNearbyAlert,
+      onVisionRequest,
+      onWakeRequested,
+      onClose: onNearbyClose,
+    })
     return () => {
       active = false
-      window.clearInterval(interval)
+      disconnectLocalSocket()
       stopBackgroundGuardian()
     }
   }, [device, speakAlertOnce])
@@ -351,7 +392,7 @@ export function DeviceProvider({ children }) {
 
   const sendNearbyDeviceCommand = async (command) => {
     if (!device?.pairing_code) throw new Error('Pair your glasses before sending a nearby command.')
-    const localStatus = await sendNearbyCommand(device.pairing_code, command)
+    const localStatus = await withLocalSocket(command, () => sendNearbyCommand(device.pairing_code, command))
     setNearbyLink({ state: 'connected', status: localStatus })
     return localStatus
   }
@@ -370,9 +411,9 @@ export function DeviceProvider({ children }) {
       }
     }
     if (!device?.pairing_code) throw new Error('Pair your glasses before asking them to look ahead.')
-    const result = kind === 'read'
-      ? await sendNearbyRead(device.pairing_code)
-      : await sendNearbyDescribe(device.pairing_code)
+    const result = await withLocalSocket(kind, () => (
+      kind === 'read' ? sendNearbyRead(device.pairing_code) : sendNearbyDescribe(device.pairing_code)
+    ))
     setNearbyLink((prev) => ({ ...prev, state: 'connected' }))
     if (result?.status === 'ok' && result?.text_hi) {
       const history = saveObstacleHistoryItem({
@@ -388,7 +429,7 @@ export function DeviceProvider({ children }) {
   }
 
   const value = {
-    device, status, events, loading, nearbyLink, dataError, lastRefreshedAt, obstacleHistory,
+    device, status, events, loading, nearbyLink, dataError, lastRefreshedAt, obstacleHistory, wakeRequestedAt,
     pairDevice, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, refresh: loadDevice,
   }
 

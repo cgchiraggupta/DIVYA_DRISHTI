@@ -1,0 +1,36 @@
+{
+  "version": "5",
+  "redirects": {
+    "https://esm.sh/@supabase/supabase-js@2": "https://esm.sh/@supabase/supabase-js@2.112.4"
+  },
+  "remote": {
+    "https://esm.sh/@supabase/supabase-js@2.112.4": "cfaa762b66cf8717f1b32db2699c4277aa673b39417cb9be9c0b19d9c7786bd7"
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:@capacitor-community/bluetooth-le@^8.2.0",
+        "npm:@capacitor-community/text-to-speech@^8.0.2",
+        "npm:@capacitor/android@^8.4.2",
+        "npm:@capacitor/cli@^8.4.2",
+        "npm:@capacitor/core@^8.4.2",
+        "npm:@capacitor/haptics@^8.0.2",
+        "npm:@capgo/capacitor-speech-recognition@^8.1.10",
+        "npm:@supabase/supabase-js@^2.110.8",
+        "npm:@tailwindcss/postcss@^4.3.3",
+        "npm:@types/react-dom@^19.2.3",
+        "npm:@types/react@^19.2.17",
+        "npm:@vitejs/plugin-react@^6.0.3",
+        "npm:autoprefixer@^10.5.4",
+        "npm:lucide-react@^1.26.0",
+        "npm:oxlint@^1.71.0",
+        "npm:postcss@^8.5.22",
+        "npm:react-dom@^19.2.7",
+        "npm:react-router-dom@^7.18.1",
+        "npm:react@^19.2.7",
+        "npm:tailwindcss@^4.3.3",
+        "npm:vite@^8.1.1"
+      ]
+    }
+  }
+}

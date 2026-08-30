@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Radio } from 'lucide-react'
+import { Bluetooth, Radio } from 'lucide-react'
 import Button from '../components/Button'
 import { useDevice } from '../context/DeviceContext'
+import { isBleSupported, readPairingCodeOverBle } from '../services/bleProvisioning'
 
 const prototypePairingCode = import.meta.env.VITE_PROTOTYPE_PAIRING_CODE ?? ''
 
@@ -11,17 +12,36 @@ export default function Pairing() {
   const [code, setCode] = useState(prototypePairingCode)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [scanning, setScanning] = useState(false)
 
-  const handleSubmit = async (e) => {
-    e.preventDefault()
+  const pairWithCode = async (rawCode) => {
     setError('')
     setSubmitting(true)
     try {
-      await pairDevice(code.trim().toUpperCase())
+      await pairDevice(rawCode.trim().toUpperCase())
     } catch (err) {
       setError(err.message ?? 'Could not pair with that code. Check it and try again.')
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const handleSubmit = async (e) => {
+    e.preventDefault()
+    await pairWithCode(code)
+  }
+
+  const handleBleScan = async () => {
+    setError('')
+    setScanning(true)
+    try {
+      const found = await readPairingCodeOverBle()
+      setCode(found)
+      await pairWithCode(found)
+    } catch (err) {
+      setError(err.message ?? 'Could not read a pairing code over Bluetooth.')
+    } finally {
+      setScanning(false)
     }
   }
 
@@ -64,6 +84,20 @@ export default function Pairing() {
             {submitting ? 'Pairing…' : 'Pair device'}
           </Button>
         </form>
+
+        {isBleSupported() && (
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={handleBleScan}
+            disabled={scanning || submitting}
+            className="mt-3 w-full"
+          >
+            <Bluetooth size={16} className="mr-2 inline" />
+            {scanning ? 'Looking for glasses…' : 'Find glasses via Bluetooth'}
+          </Button>
+        )}
+
         <Link to="/wifi-setup" className="mt-5 block text-sm font-semibold text-signal-300">Using a new Wi-Fi? Set up your glasses</Link>
       </div>
     </div>

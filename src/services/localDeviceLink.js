@@ -102,6 +102,14 @@ async function request(path, pairingCode, options = {}) {
   return tryRequest(url, path, pairingCode, options)
 }
 
+/** Resolve just the host (no scheme/port) behind the same discovery chain
+ * (native mDNS/NSD -> hardcoded hosts -> cached last-known-good URL) used by
+ * the HTTP link above, so the WebSocket link doesn't duplicate discovery. */
+export async function getLocalDeviceHost() {
+  const url = await getLocalDeviceUrl()
+  return new URL(url).hostname
+}
+
 export function getNearbyDeviceStatus(pairingCode) {
   return request('/v1/status', pairingCode, {
     connectTimeout: 3_000,

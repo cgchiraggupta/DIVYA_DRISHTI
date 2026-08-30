@@ -1,9 +1,11 @@
+import { useCallback, useEffect, useState } from 'react'
 import { HeartPulse, RefreshCw } from 'lucide-react'
 import Layout from '../components/Layout'
 import Card from '../components/Card'
 import Button from '../components/Button'
 import { useDevice } from '../context/DeviceContext'
 import { timeAgo } from '../lib/format'
+import { checkMicPermission } from '../services/phoneSpeech'
 
 function Row({ label, value, ok }) {
   return (
@@ -18,6 +20,20 @@ function Row({ label, value, ok }) {
 
 export default function Diagnostics() {
   const { device, status, refresh, loading, dataError } = useDevice()
+  const [micOk, setMicOk] = useState(null)
+
+  const loadMic = useCallback(() => {
+    checkMicPermission().then(setMicOk)
+  }, [])
+
+  useEffect(() => {
+    loadMic()
+  }, [loadMic])
+
+  const handleRefresh = () => {
+    refresh()
+    loadMic()
+  }
 
   return (
     <Layout title="Device care" subtitle="A quick check of your glasses">
@@ -32,14 +48,19 @@ export default function Diagnostics() {
           <Row label="Left sensing" value={status?.tof_left_ok ? 'Working well' : 'Needs attention'} ok={status?.tof_left_ok} />
           <Row label="Right sensing" value={status?.tof_right_ok ? 'Working well' : 'Needs attention'} ok={status?.tof_right_ok} />
           <Row label="Camera" value={status?.camera_ok ? 'Online' : 'Unavailable'} ok={status?.camera_ok} />
-          <Row label="Microphone" value={status?.mic_ok ? 'Online' : 'Unavailable'} ok={status?.mic_ok} />
+          <Row
+            label="Microphone (phone)"
+            value={micOk === null ? 'Checking…' : micOk ? 'Permission granted' : 'Permission needed'}
+            ok={micOk === null ? undefined : micOk}
+          />
+          <Row label="Buzzer" value={status?.buzzer_ok ? 'Online' : 'Unavailable'} ok={status?.buzzer_ok} />
         </Card>
 
         <Card eyebrow="Live status" title="Refresh device information">
           <p className="text-sm text-mist-400 mb-4">
             Refresh checks the latest status sent by your glasses. It does not start sound, vibration, or a hardware self-test.
           </p>
-          <Button onClick={refresh} disabled={loading || !device} className="w-full">
+          <Button onClick={handleRefresh} disabled={loading || !device} className="w-full">
             <RefreshCw size={16} />
             {loading ? 'Refreshing…' : 'Refresh status'}
           </Button>

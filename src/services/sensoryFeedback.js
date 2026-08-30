@@ -64,7 +64,6 @@ export async function stopSpeech() {
 export async function speakGuidance(text, volume = 1, { fast = false } = {}) {
   if (!text) return
   lastSpokenText = text
-  // Glasses Bluetooth earbuds are the walk speaker; do not also play here.
   if (!isPhoneSpeaker()) return
 
   if (fast) {

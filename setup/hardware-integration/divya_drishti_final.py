@@ -18,20 +18,22 @@ import random
 import string
 import sys
 import hmac
+import asyncio
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+import websockets
 import smbus2
-import speech_recognition as sr
 import requests
 from picamera2 import Picamera2
 import base64
-import tempfile
 from gemini_describe import (
-    describe_frame,
-    describe_obstacle,
-    describe_scene_auto,
+    auto_describe_gate_or_busy,
+    describe_cooldown_or_busy,
     frame_to_jpeg_bytes,
+    obstacle_gate_or_skip,
+    release_describe_gate,
 )
 
 try:
@@ -45,12 +47,15 @@ except ImportError:
 # ══════════════════════════════════════════
 MOTOR_LEFT  = 12   # Pin 32
 MOTOR_RIGHT = 13   # Pin 33
+BUZZER_PIN  = 20   # Pin 38 -- freed 2026-08-29, confirmed audible 2026-08-31
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(MOTOR_LEFT,  GPIO.OUT)
 GPIO.setup(MOTOR_RIGHT, GPIO.OUT)
+GPIO.setup(BUZZER_PIN,  GPIO.OUT)
 GPIO.output(MOTOR_LEFT,  GPIO.LOW)
 GPIO.output(MOTOR_RIGHT, GPIO.LOW)
+GPIO.output(BUZZER_PIN,  GPIO.LOW)
 
 # ══════════════════════════════════════════
 #  THRESHOLDS
@@ -111,6 +116,7 @@ state = {
     "tof_right_ok":    False,
     "camera_ok":       False,
     "mic_ok":          True,
+    "buzzer_ok":       True,
     "haptics_muted":   False,
     "device_id":       None,
     "pairing_code":    None,
@@ -157,6 +163,10 @@ tof_samples = {
     "right": {"value": None, "at": 0.0},
 }
 LOCAL_LINK_PORT = 8765
+# Separate port for the WebSocket push link (§ "LOCAL COMPANION LINK — WEBSOCKET
+# PUSH"). The HTTP link above stays on 8765 unchanged for the wake-word/button
+# services and as a fallback.
+WS_LINK_PORT = 8766
 
 # Runtime settings are intentionally narrow: they adjust early guidance but
 # never disable close-range protection. These values are changed only by a
@@ -388,10 +398,6 @@ def random_pairing_code():
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(random.choice(alphabet) for _ in range(6))
 
-def speak_pairing_code(code):
-    spaced = ". ".join(code)
-    speak(f"Your pairing code is {spaced}. I repeat. {spaced}", blocking=True)
-
 def register_device_if_needed():
     """Register once and keep the server-assigned device ID on the Pi."""
     if not sync_enabled():
@@ -432,7 +438,9 @@ def register_device_if_needed():
                     state["device_id"] = saved["device_id"]
                     state["pairing_code"] = pairing_code
                 print(f"[SYNC] Registered device with pairing code {pairing_code}")
-                speak_pairing_code(pairing_code)
+                # The Pi has no speaker — the phone reads this over BLE
+                # (PairingCodeCharacteristic in divyadrishti-ble-provisioner.py),
+                # the same step it already uses for Wi-Fi setup.
                 return saved
             print(f"[SYNC] Registration rejected ({response.status_code})")
         except requests.RequestException as error:
@@ -464,6 +472,7 @@ def queue_status(current_alert, mode):
             "tof_right_ok": state["tof_right_ok"],
             "camera_ok": state["camera_ok"],
             "mic_ok": state["mic_ok"],
+            "buzzer_ok": state["buzzer_ok"],
             "mode": mode,
             "current_alert": current_alert,
             "updated_at": utc_now(),
@@ -478,6 +487,7 @@ def queue_status(current_alert, mode):
         }
         pending_status_version += 1
         status_sync_requested.set()
+    ws_broadcast({"type": "status", "payload": local_status_snapshot()})
 
 def queue_event(event_type, detail):
     with state_lock:
@@ -515,29 +525,41 @@ def publish_phone_alert(payload):
         if len(queue) > 8:
             del queue[:-8]
         snapshot = dict(item)
+    ws_broadcast({"type": "alert", "payload": snapshot})
     return snapshot
 
 
 def obstacle_phone_guidance_worker(frame, direction, distance_mm, event_type, image_jpeg_b64="", alert_id=None):
-    """Background: Gemini labels NEAR obstacle only; phone already has the photo."""
+    """Background: ask the connected phone to label the near obstacle; phone
+    already has the instant distance line, this just names the object."""
     try:
         max_range_mm = runtime_settings_snapshot().get("sensitivity_mm", 2500)
-        result = describe_obstacle(
-            frame,
-            direction=direction,
-            distance_mm=distance_mm,
-            max_range_mm=max_range_mm,
-        )
-        # "busy": another obstacle call is already in flight (Gemini allows
-        # only one at a time now). The phone already has the instant distance
-        # line, so just leave it — no point overwriting it with nothing.
+        gate_result = obstacle_gate_or_skip(direction, distance_mm, max_range_mm)
+        if gate_result is not None:
+            result = gate_result
+        else:
+            try:
+                jpeg = frame_to_jpeg_bytes(frame)
+                phone_result = request_phone_vision(
+                    "obstacle", jpeg, PHONE_VISION_TIMEOUT_S,
+                    extra={"direction": direction, "distance_mm": distance_mm, "max_range_mm": max_range_mm},
+                )
+                result = phone_result if phone_result is not None else {
+                    "status": "error", "text_hi": "", "source": "no_phone",
+                }
+            finally:
+                release_describe_gate()
+
+        # "busy": another obstacle call is already in flight. The phone
+        # already has the instant distance line, so just leave it — no
+        # point overwriting it with nothing.
         if result.get("status") in ("cooldown", "skipped", "busy"):
             return
         text_hi = (result.get("text_hi") or "").strip()
         if not text_hi:
             return
         if result.get("status") == "error":
-            print(f"[DESCRIBE] Obstacle Gemini fallback, reason: {result.get('error')}")
+            print(f"[DESCRIBE] Obstacle guidance fallback, reason: {result.get('error')}")
         payload = {
             "kind": "obstacle",
             "event_type": event_type,
@@ -547,11 +569,9 @@ def obstacle_phone_guidance_worker(frame, direction, distance_mm, event_type, im
             "text_hi": text_hi,
             "image_jpeg_b64": "",
             "source": result.get("source"),
-            "speak": False,
             "replaces_alert_id": alert_id,
         }
         publish_phone_alert(payload)
-        speak(text_hi)
         queue_event(event_type, {
             "distance_mm": distance_mm,
             "direction": direction,
@@ -560,7 +580,7 @@ def obstacle_phone_guidance_worker(frame, direction, distance_mm, event_type, im
             "object_label": text_hi,
             "gemini": True,
         })
-        print(f"[DESCRIBE] Obstacle Gemini ready ({result.get('source')})")
+        print(f"[DESCRIBE] Obstacle guidance ready ({result.get('source')})")
     except Exception as error:
         print(f"[DESCRIBE] Obstacle guidance failed: {error}")
 
@@ -654,46 +674,52 @@ def _mean_abs_diff(gray_a, gray_b):
 
 
 def _auto_describe_worker(frame, gray_candidate):
-    """Background: ask Gemini to describe this frame, retrying through a
-    busy Gemini slot (e.g. an obstacle-naming call in progress) for a while
-    instead of giving up immediately — this is what makes an obstacle event
-    "win" in the moment without silently dropping the scene description."""
+    """Background: ask the connected phone to describe this frame, retrying
+    through a busy slot (e.g. an obstacle-naming call in progress) for a
+    while instead of giving up immediately — this is what makes an obstacle
+    event "win" in the moment without silently dropping the scene
+    description."""
     try:
         deadline = time.monotonic() + AUTO_DESCRIBE_MAX_WAIT_SECONDS
+        jpeg = frame_to_jpeg_bytes(frame)
         while True:
             with state_lock:
                 if state["paused"]:
                     return
-            result = describe_scene_auto(frame)
-            status = result.get("status")
-            if status == "busy" and time.monotonic() < deadline:
-                time.sleep(1.0)
-                continue
-            if status == "ok":
-                text_hi = (result.get("text_hi") or "").strip()
-                if text_hi:
-                    publish_phone_alert({
-                        "kind": "auto_describe",
-                        "event_type": "voice_command",
-                        "speak_hi": text_hi,
-                        "text_hi": text_hi,
-                        "image_jpeg_b64": result.get("image_jpeg_b64") or "",
-                        "source": result.get("source"),
-                        "speak": False,
-                    })
-                    speak(text_hi)
-                    queue_event("voice_command", {
-                        "command": "auto_describe",
-                        "source": "glasses_auto",
-                        "status": "ok",
-                        "speak_hi": text_hi,
-                    })
-                    with _auto_describe_lock:
-                        _auto_describe_state["ref_gray"] = gray_candidate
-                        _auto_describe_state["last_spoken_at"] = time.monotonic()
-                        _auto_describe_state["startup_describe_due"] = False
-                    print("[DESCRIBE] Auto scene-describe spoken (next ambient describe in "
-                          f"~{AUTO_DESCRIBE_INTERVAL_SECONDS / 60:.0f} min)")
+            gate_result = auto_describe_gate_or_busy()
+            if gate_result is not None:
+                if gate_result.get("status") == "busy" and time.monotonic() < deadline:
+                    time.sleep(1.0)
+                    continue
+                return
+            try:
+                phone_result = request_phone_vision("describe", jpeg, PHONE_VISION_TIMEOUT_S)
+            finally:
+                release_describe_gate()
+            if phone_result is None or phone_result.get("status") != "ok":
+                return
+            text_hi = (phone_result.get("text_hi") or "").strip()
+            if text_hi:
+                publish_phone_alert({
+                    "kind": "auto_describe",
+                    "event_type": "voice_command",
+                    "speak_hi": text_hi,
+                    "text_hi": text_hi,
+                    "image_jpeg_b64": base64.b64encode(jpeg).decode("ascii"),
+                    "source": phone_result.get("source"),
+                })
+                queue_event("voice_command", {
+                    "command": "auto_describe",
+                    "source": "glasses_auto",
+                    "status": "ok",
+                    "speak_hi": text_hi,
+                })
+                with _auto_describe_lock:
+                    _auto_describe_state["ref_gray"] = gray_candidate
+                    _auto_describe_state["last_spoken_at"] = time.monotonic()
+                    _auto_describe_state["startup_describe_due"] = False
+                print("[DESCRIBE] Auto scene-describe spoken (next ambient describe in "
+                      f"~{AUTO_DESCRIBE_INTERVAL_SECONDS / 60:.0f} min)")
             return
     except Exception as error:
         print(f"[DESCRIBE] Auto scene-describe failed: {error}")
@@ -794,6 +820,7 @@ def local_status_snapshot():
             "tof_right_ok": state["tof_right_ok"],
             "camera_ok": state["camera_ok"],
             "mic_ok": state["mic_ok"],
+            "buzzer_ok": state["buzzer_ok"],
             "updated_at": utc_now(),
             "settings": runtime_settings_snapshot(),
         }
@@ -893,72 +920,80 @@ class LocalLinkHandler(BaseHTTPRequestHandler):
             })
             return
 
-        command = str(payload.get("command", "")).lower()
-        if command not in ("pause", "resume", "describe", "read", "unmute_haptics"):
-            self.send_json(400, {"error": "Unsupported command"})
-            return
+        status_code, result = dispatch_companion_command(payload.get("command"))
+        self.send_json(status_code, result)
 
-        if command in ("describe", "read"):
-            picam2 = camera_holder.get("picam2")
-            if picam2 is None:
-                self.send_json(503, {
-                    "status": "error",
-                    "text_hi": "कैमरा उपलब्ध नहीं है।",
-                    "source": "fallback",
-                })
-                return
-            set_haptics_muted(True)
-            try:
-                with camera_lock:
-                    frame = picam2.capture_array()
-                result = describe_frame(frame, include_image=True, mode=command)
-            except Exception as error:
-                print(f"[DESCRIBE] Failed: {error}")
-                set_haptics_muted(False)
-                self.send_json(500, {
-                    "status": "error",
-                    "text_hi": "अभी बता नहीं पाए। थोड़ी देर बाद फिर कोशिश करें।",
-                    "source": "fallback",
-                    "error": str(error),
-                })
-                return
-            if result.get("text_hi"):
-                publish_phone_alert({
-                    "kind": command,
-                    "event_type": "voice_command",
-                    "speak_hi": result["text_hi"],
-                    "text_hi": result["text_hi"],
-                    "image_jpeg_b64": result.get("image_jpeg_b64") or "",
-                    "source": command,
-                    "speak": False,
-                })
-                speak(result["text_hi"])
-            # Keep motors quiet while phone speaks; companion can resume via resume/describe-done.
-            # Auto-unmute after 20s as a safety net.
-            def _unmute_later():
-                time.sleep(20)
-                set_haptics_muted(False)
-            threading.Thread(target=_unmute_later, daemon=True).start()
-            queue_event("voice_command", {
-                "command": command,
-                "source": "companion_app",
-                "status": result.get("status"),
-                "speak_hi": result.get("text_hi"),
-            })
-            self.send_json(200, result)
-            return
+def dispatch_companion_command(command):
+    """Run a companion command, returning (status_code, payload). Shared by the
+    HTTP link (above) and the WebSocket link so both surfaces behave identically."""
+    command = str(command or "").lower()
+    if command not in (
+        "pause", "resume", "describe", "read", "read_full",
+        "unmute_haptics", "wake",
+    ):
+        return 400, {"error": "Unsupported command"}
 
-        if command == "unmute_haptics":
+    if command == "wake":
+        # The Pi has no mic of its own — tell the phone to start listening,
+        # same as if the person had tapped its listen button.
+        ws_broadcast({"type": "wake_requested"})
+        return 200, local_status_snapshot()
+
+    if command in ("describe", "read", "read_full"):
+        picam2 = camera_holder.get("picam2")
+        if picam2 is None:
+            return 503, {
+                "status": "error",
+                "text_hi": "कैमरा उपलब्ध नहीं है।",
+                "source": "fallback",
+            }
+        set_haptics_muted(True)
+        try:
+            with camera_lock:
+                frame = picam2.capture_array()
+            result = _describe_via_phone_or_local(frame, command)
+        except Exception as error:
+            print(f"[DESCRIBE] Failed: {error}")
             set_haptics_muted(False)
-            self.send_json(200, local_status_snapshot())
-            return
+            return 500, {
+                "status": "error",
+                "text_hi": "अभी बता नहीं पाए। थोड़ी देर बाद फिर कोशिश करें।",
+                "source": "fallback",
+                "error": str(error),
+            }
+        if result.get("text_hi"):
+            publish_phone_alert({
+                "kind": command,
+                "event_type": "voice_command",
+                "speak_hi": result["text_hi"],
+                "text_hi": result["text_hi"],
+                "image_jpeg_b64": result.get("image_jpeg_b64") or "",
+                "source": command,
+            })
+        # Keep motors quiet while phone speaks; companion can resume via resume/describe-done.
+        # Auto-unmute after 20s as a safety net.
+        def _unmute_later():
+            time.sleep(20)
+            set_haptics_muted(False)
+        threading.Thread(target=_unmute_later, daemon=True).start()
+        queue_event("voice_command", {
+            "command": command,
+            "source": "companion_app",
+            "status": result.get("status"),
+            "speak_hi": result.get("text_hi"),
+        })
+        return 200, result
 
-        with state_lock:
-            state["paused"] = command == "pause"
-            if command == "resume":
-                state["haptics_muted"] = False
-        queue_event("voice_command", {"command": command, "source": "companion_app"})
-        self.send_json(200, local_status_snapshot())
+    if command == "unmute_haptics":
+        set_haptics_muted(False)
+        return 200, local_status_snapshot()
+
+    with state_lock:
+        state["paused"] = command == "pause"
+        if command == "resume":
+            state["haptics_muted"] = False
+    queue_event("voice_command", {"command": command, "source": "companion_app"})
+    return 200, local_status_snapshot()
 
 def start_local_link(stop_event):
     try:
@@ -976,6 +1011,247 @@ def start_local_link(stop_event):
 
     threading.Thread(target=serve, daemon=True).start()
     return server
+
+# ══════════════════════════════════════════
+#  LOCAL COMPANION LINK — WEBSOCKET PUSH
+#  Same pairing code, same phone, same commands/settings as the HTTP link
+#  above — but push-based, so status and obstacle alerts reach the phone the
+#  instant they happen instead of waiting for the phone's next poll. The
+#  HTTP link stays exactly as-is: the wake-word and control-button services
+#  keep using it, and the phone app falls back to it if a socket can't stay
+#  open.
+# ══════════════════════════════════════════
+
+ws_clients_lock = threading.Lock()
+ws_clients = set()
+ws_loop = None
+
+def _ws_pairing_code_matches(query_code):
+    with state_lock:
+        expected = state["pairing_code"] or ""
+    received = (query_code or "").strip().upper()
+    return bool(expected and received and hmac.compare_digest(expected.upper(), received))
+
+def ws_broadcast(message):
+    """Thread-safe push to every connected companion socket. A no-op if the
+    WebSocket server isn't running or has no clients — safe to call from
+    anywhere, including before start_ws_link() has run."""
+    if ws_loop is None:
+        return
+    with ws_clients_lock:
+        clients = list(ws_clients)
+    if not clients:
+        return
+    body = json.dumps(message)
+
+    async def _send_all():
+        for client in clients:
+            try:
+                await client.send(body)
+            except Exception:
+                pass
+
+    try:
+        asyncio.run_coroutine_threadsafe(_send_all(), ws_loop)
+    except RuntimeError:
+        pass
+
+# ── Phone-side Gemini processing ────────────────────────────────────────
+# describe/read/read_full normally ask the connected phone to run Gemini
+# (over an edge function, keeping the Pi's own key as an emergency-only
+# fallback) instead of the Pi calling Gemini itself. See
+# request_phone_vision()/_describe_via_phone_or_local() below.
+pending_vision_lock = threading.Lock()
+pending_vision_requests = {}
+_next_vision_request_id = 0
+
+PHONE_VISION_TIMEOUT_S = 30
+PHONE_VISION_FULL_TIMEOUT_S = 45
+
+
+def request_phone_vision(mode, jpeg_bytes, timeout, extra=None):
+    """Ask a connected phone to run Gemini on this photo and wait for its
+    reply. Returns the phone's result payload, or None if no phone is
+    connected or it didn't reply in time — the Pi has no Gemini key of its
+    own, so callers must treat None as "this didn't happen this time"."""
+    global _next_vision_request_id
+    with ws_clients_lock:
+        has_client = bool(ws_clients)
+    if not has_client:
+        return None
+
+    event = threading.Event()
+    with pending_vision_lock:
+        _next_vision_request_id += 1
+        request_id = _next_vision_request_id
+        pending_vision_requests[request_id] = {"event": event, "payload": None}
+
+    ws_broadcast({
+        "type": "vision_request",
+        "request_id": request_id,
+        "payload": {
+            "mode": mode,
+            "image_jpeg_b64": base64.b64encode(jpeg_bytes).decode("ascii"),
+            **(extra or {}),
+        },
+    })
+
+    got_reply = event.wait(timeout)
+    with pending_vision_lock:
+        entry = pending_vision_requests.pop(request_id, None)
+    if not got_reply or entry is None:
+        return None
+    return entry["payload"]
+
+
+def _describe_via_phone_or_local(frame, mode):
+    """Shared entry point for every on-demand describe/read/read_full call
+    (button, HTTP link, WS command). The Pi has no Gemini key of its own —
+    if no phone is connected or it doesn't reply in time, this just fails;
+    buzzer/vibration are unaffected since they never depend on this."""
+    jpeg = frame_to_jpeg_bytes(frame)
+    gate_result = describe_cooldown_or_busy()
+    if gate_result is not None:
+        return {**gate_result, "mode": mode}
+
+    try:
+        timeout = PHONE_VISION_FULL_TIMEOUT_S if mode == "read_full" else PHONE_VISION_TIMEOUT_S
+        phone_result = request_phone_vision(mode, jpeg, timeout)
+        if phone_result is not None:
+            result = {**phone_result, "mode": mode}
+        else:
+            result = {
+                "status": "error",
+                "text_hi": "फोन उपलब्ध नहीं है।",
+                "source": "no_phone",
+                "mode": mode,
+            }
+    finally:
+        release_describe_gate()
+
+    result["image_jpeg_b64"] = base64.b64encode(jpeg).decode("ascii")
+    return result
+
+async def _ws_handle_message(websocket, raw):
+    try:
+        message = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return
+    kind = message.get("type")
+    request_id = message.get("request_id")
+    loop = asyncio.get_event_loop()
+
+    if kind == "get_status":
+        await websocket.send(json.dumps({"type": "status", "payload": local_status_snapshot()}))
+        return
+
+    if kind == "update_settings":
+        try:
+            settings = await loop.run_in_executor(
+                None, apply_settings_from_companion, message.get("payload") or {}
+            )
+            await websocket.send(json.dumps({
+                "type": "settings_ack",
+                "request_id": request_id,
+                "payload": {"status": "ok", "settings": settings, "updated_at": utc_now()},
+            }))
+        except ValueError as error:
+            await websocket.send(json.dumps({
+                "type": "settings_ack",
+                "request_id": request_id,
+                "payload": {"status": "error", "error": str(error)},
+            }))
+        except Exception as error:
+            print(f"[WS] Settings apply failed: {error}")
+            await websocket.send(json.dumps({
+                "type": "settings_ack",
+                "request_id": request_id,
+                "payload": {"status": "error", "error": "Could not apply settings"},
+            }))
+        return
+
+    if kind == "command":
+        command = (message.get("payload") or {}).get("command")
+        status_code, result = await loop.run_in_executor(None, dispatch_companion_command, command)
+        await websocket.send(json.dumps({
+            "type": "command_result",
+            "request_id": request_id,
+            "status_code": status_code,
+            "payload": result,
+        }))
+        return
+
+    if kind == "vision_result":
+        # Reply to a Pi-initiated vision_request — see request_phone_vision().
+        with pending_vision_lock:
+            entry = pending_vision_requests.get(request_id)
+            if entry is not None:
+                entry["payload"] = message.get("payload")
+        if entry is not None:
+            entry["event"].set()
+        return
+
+async def ws_handler(websocket):
+    request_path = getattr(websocket, "path", None)
+    if request_path is None and getattr(websocket, "request", None) is not None:
+        request_path = websocket.request.path
+    query = parse_qs(urlsplit(request_path or "").query)
+    code = (query.get("code") or [""])[0]
+    if not _ws_pairing_code_matches(code):
+        await websocket.close(code=4401, reason="Pairing required")
+        return
+
+    with ws_clients_lock:
+        ws_clients.add(websocket)
+    try:
+        await websocket.send(json.dumps({"type": "status", "payload": local_status_snapshot()}))
+        async for raw in websocket:
+            await _ws_handle_message(websocket, raw)
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        with ws_clients_lock:
+            ws_clients.discard(websocket)
+
+def start_ws_link(stop_event):
+    """Run the WebSocket push server on its own asyncio loop/thread, leaving
+    the rest of the (synchronous) program untouched."""
+    global ws_loop
+
+    def run_loop():
+        global ws_loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # websockets >=13 builds the Server object inside serve() itself,
+        # which calls asyncio.get_running_loop() immediately — so serve()
+        # must be awaited from inside a coroutine already running on this
+        # loop, not called as a bare expression before run_until_complete
+        # starts (that raises "no running event loop" on this version).
+        async def _serve():
+            return await websockets.serve(ws_handler, "0.0.0.0", WS_LINK_PORT)
+
+        try:
+            server = loop.run_until_complete(_serve())
+        except OSError as error:
+            print(f"[WS] Could not start companion socket: {error}")
+            return
+        ws_loop = loop
+        print(f"[WS] Companion push link ready on port {WS_LINK_PORT}")
+
+        async def _watch_stop():
+            while not stop_event.is_set():
+                await asyncio.sleep(0.5)
+            server.close()
+            await server.wait_closed()
+            loop.stop()
+
+        loop.create_task(_watch_stop())
+        loop.run_forever()
+        loop.close()
+        ws_loop = None
+
+    threading.Thread(target=run_loop, daemon=True).start()
 
 def send_sync_request(method, endpoint, payload, prefer="return=minimal"):
     """Perform one bounded cloud request and report success to the caller."""
@@ -1059,192 +1335,14 @@ def sync_worker(stop_event):
             sync_queue.task_done()
 
 # ══════════════════════════════════════════
-#  AUDIO
+#  PHONE ANNOUNCEMENTS
+#  The Pi has no mic or speaker of its own — every spoken word happens on
+#  the phone. This queues text for the phone to say, the same mechanism
+#  publish_phone_alert() already uses for obstacle/describe/read alerts
+#  (DeviceContext.jsx speaks any "announcement"-kind alert unconditionally).
 # ══════════════════════════════════════════
-# Guidance voice is the Bluetooth earbuds on this Pi (Nirvana Ion A2DP).
-# Phone TTS is muted on these payloads so the wearer does not hear two voices.
-GLASSES_SPEAKER_ENABLED = True
-BT_SPEAKER_MAC = "90:A0:BE:CA:23:A9"
-BT_APLAY_DEV = f"bluealsa:DEV={BT_SPEAKER_MAC},PROFILE=a2dp"
-BT_SCO_DEV = f"bluealsa:DEV={BT_SPEAKER_MAC},PROFILE=sco"
-BT_HFP_SOURCE = (
-    f"/org/bluealsa/hci0/dev_{BT_SPEAKER_MAC.replace(':', '_')}/hfpag/source"
-)
-BT_HFP_SINK = (
-    f"/org/bluealsa/hci0/dev_{BT_SPEAKER_MAC.replace(':', '_')}/hfpag/sink"
-)
-BT_MIC_WAV = "/tmp/dd_bt_utterance.wav"
-SARVAM_ENV_FILE = CONFIG_DIR / "sarvam.env"
-SARVAM_URL = "https://api.sarvam.ai/text-to-speech"
-SARVAM_SPEAKER = "priya"
-SARVAM_TIMEOUT_SECONDS = 6
-_bt_play_lock = threading.Lock()
-_bt_record_proc_lock = threading.Lock()
-_bt_record_proc = None
 
-
-def _load_sarvam_key():
-    key = (os.environ.get("SARVAM_API_KEY") or "").strip()
-    if key:
-        return key
-    try:
-        for line in SARVAM_ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("SARVAM_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        return ""
-    return ""
-
-
-def _sarvam_lang_for(text):
-    return "hi-IN" if any("\u0900" <= ch <= "\u097F" for ch in text) else "en-IN"
-
-
-def _fetch_sarvam_wav(text):
-    key = _load_sarvam_key()
-    if not key:
-        return None
-    try:
-        response = requests.post(
-            SARVAM_URL,
-            headers={
-                "api-subscription-key": key,
-                "Content-Type": "application/json",
-            },
-            json={
-                "text": text.strip()[:2500],
-                "target_language_code": _sarvam_lang_for(text),
-                "speaker": SARVAM_SPEAKER,
-                "model": "bulbul:v3",
-                "pace": 0.95,
-            },
-            timeout=SARVAM_TIMEOUT_SECONDS,
-        )
-        if response.status_code != 200:
-            print(f"[AUDIO] Sarvam HTTP {response.status_code}")
-            return None
-        audio_b64 = (response.json().get("audios") or [None])[0]
-        if not audio_b64:
-            print("[AUDIO] Sarvam returned no audio")
-            return None
-        return base64.b64decode(audio_b64)
-    except Exception as error:
-        print(f"[AUDIO] Sarvam failed: {type(error).__name__}")
-        return None
-
-
-def _ensure_bt_speaker():
-    try:
-        listed = subprocess.check_output(
-            ["bluealsa-cli", "list-pcms"],
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-            text=True,
-        )
-        if BT_SPEAKER_MAC.replace(":", "_") in listed:
-            return
-    except Exception:
-        pass
-    try:
-        subprocess.run(
-            ["bluetoothctl", "connect", BT_SPEAKER_MAC],
-            timeout=6,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except Exception as error:
-        print(f"[AUDIO] BT connect skipped: {error}")
-
-
-def _espeak_voice_for(text):
-    return "hi" if any("\u0900" <= ch <= "\u097F" for ch in text) else "en"
-
-
-def _play_espeak_bt(text, volume=None):
-    voice = _espeak_voice_for(text)
-    args = ["espeak", "-s", "140", "-v", voice, "--stdout", text]
-    if volume is not None:
-        args[1:1] = ["-a", str(max(20, min(200, int(volume))))]
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.call(
-        ["aplay", "-q", "-D", BT_APLAY_DEV],
-        stdin=proc.stdout,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    proc.wait()
-
-
-def _interrupt_bt_record():
-    """Stop HFP capture so A2DP TTS can use the same earbuds."""
-    global _bt_record_proc
-    with _bt_record_proc_lock:
-        proc = _bt_record_proc
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-        except Exception:
-            return
-    try:
-        proc.wait(timeout=0.6)
-    except Exception:
-        try:
-            proc.kill()
-            proc.wait(timeout=0.3)
-        except Exception:
-            pass
-
-
-def _play_bt_speaker(text, blocking=False, volume=None):
-    if not text or not GLASSES_SPEAKER_ENABLED:
-        return
-
-    def run():
-        _interrupt_bt_record()
-        with _bt_play_lock:
-            time.sleep(0.15)
-            _ensure_bt_speaker()
-            wav = _fetch_sarvam_wav(text)
-            if wav:
-                print("[AUDIO] playing Sarvam")
-                try:
-                    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
-                        tmp.write(wav)
-                        tmp.flush()
-                        rc = subprocess.call(
-                            ["aplay", "-q", "-D", BT_APLAY_DEV, tmp.name],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                    if rc != 0:
-                        print(f"[AUDIO] aplay rc={rc}")
-                    else:
-                        time.sleep(0.2)
-                        return
-                except Exception as error:
-                    print(f"[AUDIO] Sarvam playback failed: {type(error).__name__}")
-            print("[AUDIO] fallback espeak")
-            try:
-                _play_espeak_bt(text, volume)
-            except Exception as error:
-                print(f"[AUDIO] BT playback failed: {error}")
-            time.sleep(0.2)
-
-    if blocking:
-        run()
-    else:
-        threading.Thread(target=run, daemon=True).start()
-
-
-def speak(text, blocking=False, volume=None):
-    print(f"[AUDIO] {text}")
+def announce(text):
     try:
         publish_phone_alert({
             "kind": "announcement",
@@ -1255,11 +1353,10 @@ def speak(text, blocking=False, volume=None):
             "text_hi": text,
             "image_jpeg_b64": "",
             "source": "glasses_voice",
-            "speak": False,
         })
     except Exception as error:
         print(f"[AUDIO] Could not hand speech to the phone: {error}")
-    _play_bt_speaker(text, blocking=blocking, volume=volume)
+
 
 # ══════════════════════════════════════════
 #  VIBRATION (dual motor, directional)
@@ -1302,6 +1399,30 @@ def vibrate_pattern(side, pattern, configured_intensity=None):
     elif pattern == "pulse":
         vibrate(side, 0.5, scaled(80))
 
+# ══════════════════════════════════════════
+#  BUZZER (single piezo, GPIO20)
+# ══════════════════════════════════════════
+buzzer_lock = threading.Lock()
+
+def _buzz_pulse(duration):
+    with buzzer_lock:
+        GPIO.output(BUZZER_PIN, GPIO.HIGH)
+        time.sleep(duration)
+        GPIO.output(BUZZER_PIN, GPIO.LOW)
+
+def buzz_pattern(pattern):
+    """Mirrors vibrate_pattern's timing so the buzzer and motors read as one cue."""
+    if pattern == "rapid":
+        _buzz_pulse(0.12)
+    elif pattern == "double":
+        _buzz_pulse(0.1)
+        time.sleep(0.08)
+        _buzz_pulse(0.1)
+    elif pattern == "single":
+        _buzz_pulse(0.15)
+    elif pattern == "pulse":
+        _buzz_pulse(0.25)
+
 def deliver_haptic_burst(side, pattern, count=HAPTIC_OPENING_BURST_COUNT):
     """Two (or count) haptic pulses, then stop — used for the opening warning."""
     def run():
@@ -1319,12 +1440,13 @@ def deliver_alert(side, pattern, message):
     feedback_mode = settings["feedback_mode"]
     with state_lock:
         haptics_muted = state.get("haptics_muted", False)
-    # Glasses speaker is weak — still attempt audio if configured, but never
-    # vibrate while the phone is speaking a describe/read result.
+    # Audio guidance is spoken on the phone, not the glasses — never vibrate
+    # while the phone is speaking a describe/read result.
     if message and feedback_mode in ("audio", "both") and not haptics_muted:
-        speak(message, volume=settings["volume"])
+        announce(message)
     if side and pattern and feedback_mode in ("vibration", "both") and not haptics_muted:
         vibrate_pattern(side, pattern, settings["vibration_intensity"])
+        threading.Thread(target=buzz_pattern, args=(pattern,), daemon=True).start()
 
 # ══════════════════════════════════════════
 #  TOF SENSORS (dual, separate I2C buses)
@@ -1761,10 +1883,7 @@ def detection_loop(picam2, tof1, tof2, stop_event):
                         "text_hi": quick_hi,
                         "image_jpeg_b64": "",
                         "source": "tof_snapshot",
-                        "speak": False,
                     })
-                    if speak_now:
-                        speak(quick_hi)
                     # Opening warning: two distinct buzzes, haptic only on glasses.
                     deliver_haptic_burst(side, pattern, HAPTIC_OPENING_BURST_COUNT)
                     queue_event(event_type, event_detail)
@@ -1821,7 +1940,6 @@ def detection_loop(picam2, tof1, tof2, stop_event):
                                 "text_hi": f"{dir_hi} बाधा है, लगभग {dist_label}।",
                                 "image_jpeg_b64": "",
                                 "source": "tof_live",
-                                "speak": False,
                             })
                         except Exception as snap_error:
                             print(f"[CAMERA] Live snapshot skipped: {snap_error}")
@@ -1855,272 +1973,12 @@ def detection_loop(picam2, tof1, tof2, stop_event):
         time.sleep(0.3)
 
 # ══════════════════════════════════════════
-#  VOICE COMMAND LOOP (main thread)
-#  Earbud Hands-Free mic (HFP SCO) → Google STT → same intents as the phone.
-#  Always-on HFP stays connected, but commands require Hey Divya / हे दिव्या.
-#  Unknown/ambient speech stays silent. Replies go out Sarvam on A2DP.
-# ══════════════════════════════════════════
-def _ensure_bt_mic():
-    _ensure_bt_speaker()
-    for pcm in (BT_HFP_SOURCE, BT_HFP_SINK):
-        try:
-            subprocess.run(
-                ["bluealsa-cli", "codec", pcm, "CVSD"],
-                timeout=3,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except Exception:
-            pass
-
-
-def _wav_peak(path):
-    try:
-        import wave
-        import array
-        with wave.open(path, "rb") as handle:
-            frames = handle.readframes(handle.getnframes())
-        if len(frames) < 4:
-            return 0
-        samples = array.array("h", frames[: len(frames) - (len(frames) % 2)])
-        return max(abs(sample) for sample in samples) if samples else 0
-    except Exception:
-        return 0
-
-
-def _record_bt_utterance(seconds=4):
-    global _bt_record_proc
-    try:
-        os.remove(BT_MIC_WAV)
-    except OSError:
-        pass
-    with _bt_play_lock:
-        _ensure_bt_mic()
-        proc = subprocess.Popen(
-            [
-                "arecord", "-q",
-                "-D", BT_SCO_DEV,
-                "-f", "S16_LE", "-c", "1", "-r", "8000",
-                "-d", str(int(seconds)),
-                BT_MIC_WAV,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        with _bt_record_proc_lock:
-            _bt_record_proc = proc
-        try:
-            proc.wait(timeout=int(seconds) + 2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        finally:
-            with _bt_record_proc_lock:
-                if _bt_record_proc is proc:
-                    _bt_record_proc = None
-        if proc.returncode != 0:
-            return None
-        if not os.path.exists(BT_MIC_WAV) or _wav_peak(BT_MIC_WAV) < 800:
-            return None
-        return BT_MIC_WAV
-
-
-def _transcribe_bt_wav(path):
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(path) as source:
-        audio = recognizer.record(source)
-    for language in ("hi-IN", "en-IN"):
-        try:
-            return recognizer.recognize_google(audio, language=language)
-        except sr.UnknownValueError:
-            continue
-        except sr.RequestError as error:
-            print(f"[MIC] STT error: {type(error).__name__}")
-            return None
-    return None
-
-
-WAKE_PHRASES = (
-    "hey divya drishti",
-    "ok divya drishti",
-    "हे दिव्या दृष्टि",
-    "हे दिव्य दृष्टि",
-    "हे डिव्या दृष्टि",
-    "hey divya dristi",
-    "hey divyadrishti",
-    "divya drishti",
-    "divya dristi",
-    "दिव्या दृष्टि",
-    "दिव्य दृष्टि",
-    "दिव्या द्रिष्टी",
-    "hey divya",
-    "ok divya",
-    "ओके दिव्या",
-    "हे दिव्या",
-    "हे दिव्य",
-    "हे डिव्या",
-    "ए दिव्या",
-    "दिव्या",
-)
-
-
-def _normalize_voice(text):
-    lowered = (text or "").lower()
-    for mark in ("'", "’", "।", ".", "?", "!", ",", ":", ";", "“", "”"):
-        lowered = lowered.replace(mark, " ")
-    return " ".join(lowered.split())
-
-
-def _strip_wake_phrase(text):
-    normalized = _normalize_voice(text)
-    if not normalized:
-        return "", False
-    for wake in sorted(WAKE_PHRASES, key=len, reverse=True):
-        if normalized == wake:
-            return "", True
-        if normalized.startswith(wake + " "):
-            return normalized[len(wake):].strip(), True
-    compact = normalized.replace(" ", "")
-    for wake in sorted(WAKE_PHRASES, key=len, reverse=True):
-        compact_wake = wake.replace(" ", "")
-        if compact == compact_wake:
-            return "", True
-        if len(compact_wake) >= 6 and compact.startswith(compact_wake):
-            remainder = normalized.replace(wake, " ").strip() if wake in normalized else compact[len(compact_wake):]
-            return remainder, True
-    return normalized, False
-
-
-def _match_earbud_intent(text):
-    remainder, had_wake = _strip_wake_phrase(text)
-    if not remainder:
-        return ("await_command" if had_wake else "empty", had_wake)
-    checks = (
-        ("help", ("मदद", "help", "commands", "कमांड", "what can you do")),
-        ("read", ("पढ़ो", "पढो", "पढ़ कर", "क्या लिखा", "read", "ocr")),
-        ("describe", (
-            "आगे क्या", "सामने क्या", "क्या दिख", "बताओ आगे", "देखो आगे",
-            "what is ahead", "what's ahead", "whats ahead", "describe", "look ahead",
-        )),
-        ("distance", ("कितनी दूर", "कितना पास", "दूरी", "how far", "how close", "distance")),
-        ("pause", ("सेंसिंग बंद", "अलर्ट बंद", "रुक जाओ", "बंद करो", "pause")),
-        ("resume", ("सेंसिंग चालू", "शुरू करो", "चालू करो", "resume", "start sensing")),
-        ("repeat", ("फिर से बोलो", "दोबारा", "repeat", "say again")),
-        ("stop_speech", ("मत बोलो", "चुप", "stop talking", "be quiet")),
-    )
-    for intent, phrases in checks:
-        if any(phrase in remainder for phrase in phrases):
-            return intent, had_wake
-    return "unknown", had_wake
-
-
-def _latest_distance_mm():
-    with tof_sample_lock:
-        left = tof_samples["left"]["value"]
-        right = tof_samples["right"]["value"]
-    values = [value for value in (left, right) if value is not None]
-    return min(values) if values else None
-
-
-def _run_earbud_intent(intent, picam2):
-    if intent == "describe" or intent == "read":
-        if picam2 is None:
-            speak("कैमरा उपलब्ध नहीं है।", blocking=True)
-            return
-        mode = "read" if intent == "read" else "describe"
-        speak("देख रही हूँ।" if mode == "describe" else "पढ़ रही हूँ।", blocking=True)
-        try:
-            with camera_lock:
-                frame = picam2.capture_array()
-            result = describe_frame(frame, include_image=True, mode=mode)
-        except Exception as error:
-            print(f"[MIC] {mode} failed: {error}")
-            speak("अभी बता नहीं पाए।", blocking=True)
-            return
-        text_hi = (result.get("text_hi") or "").strip()
-        speak(text_hi or "अभी बता नहीं पाए।", blocking=True)
-        return
-    if intent == "distance":
-        distance_mm = _latest_distance_mm()
-        if distance_mm is None:
-            speak("अभी दूरी नहीं मिली।", blocking=True)
-        elif distance_mm < 1000:
-            speak(f"आगे लगभग {max(1, int(round(distance_mm / 10.0)))} सेंटीमीटर है।", blocking=True)
-        else:
-            speak(f"आगे लगभग {distance_mm / 1000.0:.1f} मीटर है।", blocking=True)
-        return
-    if intent == "pause":
-        with state_lock:
-            state["paused"] = True
-        speak("सेंसिंग बंद है।", blocking=True)
-        return
-    if intent == "resume":
-        with state_lock:
-            state["paused"] = False
-            state["haptics_muted"] = False
-        speak("सेंसिंग चालू है।", blocking=True)
-        return
-    if intent == "help":
-        speak("पहले हे दिव्या कहिए, फिर आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, या शुरू करो।", blocking=True)
-        return
-    if intent == "repeat":
-        speak("अभी दोहराने के लिए कुछ नहीं है।", blocking=True)
-        return
-    if intent == "stop_speech":
-        return
-    # Unknown / ambient speech: stay silent. Do not prompt for पढ़ो.
-
-
-def voice_loop(picam2, stop_event):
-    print("[MIC] Voice loop on Nirvana Ion HFP mic.")
-    print("[MIC] Wake: हे दिव्या / Hey Divya. Then: आगे क्या है, पढ़ो, कितनी दूर, रुक जाओ, शुरू करो")
-    time.sleep(1.0)
-    require_wake = True
-
-    while not stop_event.is_set():
-        try:
-            wav_path = _record_bt_utterance(4)
-            if not wav_path:
-                if not require_wake:
-                    require_wake = True
-                continue
-            time.sleep(0.35)
-            heard = _transcribe_bt_wav(wav_path)
-            if not heard:
-                if not require_wake:
-                    require_wake = True
-                continue
-            print(f"[MIC] Heard: '{heard}'")
-            intent, had_wake = _match_earbud_intent(heard)
-            print(f"[MIC] Intent: {intent} wake={had_wake} gated={require_wake}")
-            if require_wake and not had_wake and intent != "await_command":
-                print("[MIC] Ignored (no wake word)")
-                continue
-            if intent in ("empty", "unknown"):
-                require_wake = True
-                continue
-            if intent == "await_command":
-                speak("कहिए।", blocking=True)
-                time.sleep(0.4)
-                require_wake = False
-                continue
-            _run_earbud_intent(intent, picam2)
-            queue_event("voice_command", {"command": heard, "intent": intent, "source": "earbud"})
-            time.sleep(0.4)
-            require_wake = True
-        except Exception as error:
-            print(f"[MIC] Error: {type(error).__name__}")
-            time.sleep(0.5)
-
-# ══════════════════════════════════════════
 #  STARTUP SEQUENCE
 # ══════════════════════════════════════════
 def startup_sequence():
     print("=" * 50)
     print("  DIVYA DRISHTI - PHASE 1 FULL SYSTEM")
     print("=" * 50)
-    speak("Divya Drishti starting", blocking=False)
     time.sleep(0.3)
     vibrate("left",  0.2, 100)
     time.sleep(0.15)
@@ -2135,29 +1993,19 @@ def startup_sequence():
 def main():
     startup_sequence()
 
-    registered = register_device_if_needed()
-    if sync_enabled() and not registered:
-        speak("Cloud sync is unavailable. Continuing offline.")
+    register_device_if_needed()
     load_settings_state()
 
     tof1, tof2, bus3, bus4 = init_tof_sensors()
-    if tof1 is not None and tof2 is not None:
-        speak("Dual ToF sensors online.")
-    elif tof1 is not None:
-        speak("Left ToF sensor online. Right sensor unavailable.")
-    elif tof2 is not None:
-        speak("Right ToF sensor online. Left sensor unavailable.")
-    else:
-        speak("ToF sensors unavailable. Using camera detection only.")
 
     picam2 = init_camera()
     camera_holder["picam2"] = picam2
     if picam2 is not None:
-        speak("Camera ready.")
         reset_auto_describe_schedule(reason="camera ready")
 
     stop_event = threading.Event()
     start_local_link(stop_event)
+    start_ws_link(stop_event)
     if sync_enabled():
         threading.Thread(target=sync_worker, args=(stop_event,), daemon=True).start()
         threading.Thread(target=status_sync_worker, args=(stop_event,), daemon=True).start()
@@ -2170,11 +2018,11 @@ def main():
     det_thread.daemon = True
     det_thread.start()
 
-    speak("All systems active. Listening for commands.")
     vibrate("both", 0.3, 70)
 
     try:
-        voice_loop(picam2, stop_event)
+        while not stop_event.is_set():
+            time.sleep(1.0)
     except KeyboardInterrupt:
         print("\n[SYSTEM] Ctrl+C received, shutting down...")
         stop_event.set()
@@ -2214,6 +2062,7 @@ if __name__ == "__main__":
             sys.exit(1)
         link_stop_event = threading.Event()
         start_local_link(link_stop_event)
+        start_ws_link(link_stop_event)
         print("[LOCAL] Link-only mode active. Press Ctrl+C to stop.")
         try:
             while True:

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { AlertTriangle, CheckCircle2, Clock3, Ruler, Vibrate, Volume2, Wifi } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Clock3, Headphones, Ruler, Vibrate, Volume2, Wifi } from 'lucide-react'
 import Layout from '../components/Layout'
 import Card from '../components/Card'
 import Button from '../components/Button'
@@ -9,6 +9,21 @@ import { useDevice } from '../context/DeviceContext'
 import { formatDistanceMeters, timeAgo } from '../lib/format'
 import { signalGuidance, tapFeedback } from '../services/sensoryFeedback'
 import { sendNearbySettings } from '../services/localDeviceLink'
+import { isLocalSocketConnected, sendLocalSettings } from '../services/localSocketLink'
+
+/** Push settings over the socket when it's open (instant, no HTTP round
+ * trip); otherwise fall back to the existing HTTP link. Both reply with the
+ * same { status, settings, updated_at } shape from the same Pi handler. */
+async function pushNearbySettings(pairingCode, values) {
+  if (isLocalSocketConnected()) {
+    try {
+      return await sendLocalSettings(values)
+    } catch {
+      // Socket call failed in flight — fall back to HTTP below.
+    }
+  }
+  return sendNearbySettings(pairingCode, values)
+}
 
 const FEEDBACK_MODES = [
   { id: 'audio', label: 'Audio only' },
@@ -43,7 +58,7 @@ function normalizeSettings(values, fallback = DEFAULTS) {
       ? source.feedback_mode
       : fallback.feedback_mode,
     volume: clamp(source.volume, 20, 100, fallback.volume),
-    vibration_intensity: clamp(source.vibration_intensity, 40, 100, fallback.vibration_intensity),
+    vibration_intensity: clamp(source.vibration_intensity, 20, 100, fallback.vibration_intensity),
     revision: Number.isFinite(Number(source.revision)) ? Number(source.revision) : fallback.revision,
     applied_at: source.applied_at ?? fallback.applied_at,
     last_request_id: source.last_request_id ?? fallback.last_request_id,
@@ -393,7 +408,7 @@ export default function Settings() {
       // Dual path: push to nearby glasses immediately when on the same Wi-Fi.
       if (nearbyConnected) {
         try {
-          const nearby = await sendNearbySettings(device.pairing_code, {
+          const nearby = await pushNearbySettings(device.pairing_code, {
             ...submission.values,
             request_id: data.id,
           })
@@ -484,9 +499,15 @@ export default function Settings() {
           )}
         </Card>
 
-        <Card eyebrow="Audio" title="Mic and speaker">
+        <Card eyebrow="Audio" title="Earbuds">
+          <div className="mb-2 flex items-center gap-3">
+            <Headphones size={18} className="text-signal-400" />
+            <span className="text-sm text-mist-200">Paired to this phone, not the glasses</span>
+          </div>
           <p className="text-sm leading-6 text-mist-300">
-            Voice commands and spoken alerts use this phone until the glasses mic and speaker are working. Commands still run on the glasses.
+            The glasses have no mic or speaker of their own — pair your earbuds to this phone the
+            normal way, in this phone's Bluetooth settings. Every voice command, description, and
+            spoken alert comes through this phone.
           </p>
         </Card>
 
@@ -577,7 +598,7 @@ export default function Settings() {
             <Vibrate size={18} className="text-signal-400" />
             <input
               type="range"
-              min="40"
+              min="20"
               max="100"
               value={draft.vibration_intensity}
               onChange={(event) => update({ vibration_intensity: Number(event.target.value) })}
@@ -589,6 +610,7 @@ export default function Settings() {
           </div>
           <p className="mt-2 text-xs leading-5 text-mist-500">
             Urgent safety alerts keep a minimum vibration intensity, even when this slider is lower.
+            The buzzer beeps faster the closer an obstacle gets, so a lower motor setting still keeps you covered.
           </p>
         </Card>
 

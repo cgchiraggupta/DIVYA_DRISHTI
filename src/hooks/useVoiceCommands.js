@@ -3,10 +3,11 @@ import { formatDistanceMeters } from '../lib/format'
 import { getLastSpokenText, speakGuidance, stopSpeech, tapFeedback } from '../services/sensoryFeedback'
 import { listenForSpeech, playListenCue, stopListening } from '../services/phoneSpeech'
 import { helpSpeech, pickVoiceIntent } from '../services/voiceIntents'
+import { askDivya } from '../services/divyaChat'
 
-const UNKNOWN_SPEAK = 'समझ नहीं आई। कहिए आगे क्या है, पढ़ो, कितनी दूर, या मदद।'
 const WAIT_SPEAK = 'थोड़ा रुकिए, अभी एक काम चल रहा है।'
 const NO_DISTANCE_SPEAK = 'अभी दूरी नहीं मिली। थोड़ा चलिए, फिर पूछिए कितनी दूर।'
+const MAX_CHAT_HISTORY_TURNS = 8
 
 export function useVoiceCommands({
   runVision,
@@ -15,6 +16,7 @@ export function useVoiceCommands({
   getDistanceMm,
   describePending,
   commandPending,
+  pairingCode,
 }) {
   const [listening, setListening] = useState(false)
   const [handsFree, setHandsFree] = useState(false)
@@ -25,6 +27,11 @@ export function useVoiceCommands({
   const listeningRef = useRef(false)
   const mountedRef = useRef(true)
   const loopRef = useRef(0)
+  // Chat context for the current back-and-forth with Divya. Cleared whenever
+  // a fresh top-level listen starts (button/tap or hands-free turning on),
+  // not on each recursive listenAgain -- that's what keeps one conversation
+  // coherent while still starting clean each time the user re-engages.
+  const chatHistoryRef = useRef([])
 
   useEffect(() => {
     mountedRef.current = true
@@ -101,9 +108,27 @@ export function useVoiceCommands({
         return { ok: true, listenAgain: true, requireWake: false }
       case 'ignored':
         return { ok: true, silent: true }
-      default:
-        await speakGuidance(UNKNOWN_SPEAK, 1, { fast: true })
-        return { ok: false }
+      default: {
+        // Anything that doesn't match a fixed command goes to Divya as a
+        // real question instead of a dead-end "didn't understand" -- the
+        // conversation then keeps listening for a reply, turn after turn,
+        // until the user goes quiet or says a fixed command instead.
+        const question = mapped.remainder || mapped.transcript
+        if (!question) {
+          await speakGuidance('कुछ सुनाई नहीं दिया।', 1, { fast: true })
+          return { ok: false }
+        }
+        const result = await askDivya(pairingCode, question, chatHistoryRef.current)
+        if (result.ok) {
+          chatHistoryRef.current = [
+            ...chatHistoryRef.current,
+            { role: 'user', text: question },
+            { role: 'model', text: result.reply },
+          ].slice(-MAX_CHAT_HISTORY_TURNS * 2)
+        }
+        await speakGuidance(result.reply, 1, { fast: true })
+        return { ok: result.ok, listenAgain: result.ok, requireWake: false }
+      }
     }
   }, [commandPending, describePending, getDistanceMm, nearbyControlAvailable, runVision, sendNearbyDeviceCommand])
 
@@ -135,6 +160,7 @@ export function useVoiceCommands({
     setBusy(true)
     setSafeStatus({ message: 'Listening…', error: '', transcript: '' })
     tapFeedback()
+    chatHistoryRef.current = []
     try {
       await captureAndRun({ requireWake: false })
     } catch (error) {
@@ -167,6 +193,7 @@ export function useVoiceCommands({
       }
       listeningRef.current = true
       if (mountedRef.current) setListening(true)
+      chatHistoryRef.current = []
       try {
         await captureAndRun({ requireWake: true })
       } catch {

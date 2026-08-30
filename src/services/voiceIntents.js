@@ -27,15 +27,6 @@ const PHRASES = {
     'मदद',
     'कमांड',
   ],
-  stop_speech: [
-    'stop talking',
-    'be quiet',
-    'shut up',
-    'silence',
-    'मत बोलो',
-    'चुप रहो',
-    'चुप हो जाओ',
-  ],
   repeat: [
     'say that again',
     'say again',
@@ -107,6 +98,21 @@ const PHRASES = {
     'क्या दिख रहा',
     'बताओ आगे',
     'देखो आगे',
+  ],
+  // Checked last on purpose: bare "stop"/"बस" would otherwise shadow more
+  // specific compound phrases in other categories (e.g. pause's "stop
+  // sensing") since findIntent takes the first category that matches.
+  stop_speech: [
+    'stop talking',
+    'stop',
+    'be quiet',
+    'shut up',
+    'silence',
+    'मत बोलो',
+    'चुप रहो',
+    'चुप हो जाओ',
+    'बस',
+    'बात खत्म',
   ],
 }
 

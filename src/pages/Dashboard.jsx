@@ -106,7 +106,7 @@ function capabilityRow(label, value, detail, tone = 'neutral') {
 }
 
 export default function Dashboard() {
-  const { status, events, loading, nearbyLink, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, obstacleHistory, wakeRequestedAt } = useDevice()
+  const { device, status, events, loading, nearbyLink, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, obstacleHistory, wakeRequestedAt } = useDevice()
   const [sensingControl, setSensingControl] = useState({ pending: null, message: '', error: '' })
   const [describeControl, setDescribeControl] = useState({
     pending: null,
@@ -298,6 +298,8 @@ export default function Dashboard() {
     ?? null
   )
 
+  const pairingCode = isDemoMode ? import.meta.env.VITE_LOCAL_PAIRING_CODE : device?.pairing_code
+
   const voice = useVoiceCommands({
     runVision,
     sendNearbyDeviceCommand,
@@ -305,6 +307,7 @@ export default function Dashboard() {
     getDistanceMm,
     describePending,
     commandPending,
+    pairingCode,
   })
 
   // The Pi has no mic of its own — a single button click asks this phone to

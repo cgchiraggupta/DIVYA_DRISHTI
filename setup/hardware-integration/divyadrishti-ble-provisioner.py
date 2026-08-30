@@ -22,6 +22,7 @@ import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import dbus
 import dbus.mainloop.glib
@@ -43,8 +44,21 @@ SERVICE_UUID = "5f3e0001-2a11-4b0e-9c3a-1f2e3d4c5b6a"
 RX_CHRC_UUID = "5f3e0002-2a11-4b0e-9c3a-1f2e3d4c5b6a"  # write: credential chunks
 COMMIT_CHRC_UUID = "5f3e0003-2a11-4b0e-9c3a-1f2e3d4c5b6a"  # write: begin join
 STATUS_CHRC_UUID = "5f3e0004-2a11-4b0e-9c3a-1f2e3d4c5b6a"  # read/notify: state
+PAIRING_CODE_CHRC_UUID = "5f3e0005-2a11-4b0e-9c3a-1f2e3d4c5b6a"  # read: device claim code
 
 PAIRING_CODE = os.environ.get("DIVYADRISHTI_PAIRING_CODE", "").upper()
+# Unrelated to PAIRING_CODE above (which only gates Wi-Fi credential writes,
+# a manufacturing-time secret): this is the device's own Supabase claim
+# code, written by divya_drishti_final.py's register_device_if_needed(). The
+# Pi has no speaker, so this characteristic is how the phone learns it.
+DEVICE_FILE = Path.home() / ".divyadrishti" / "device.json"
+
+
+def _read_claim_code() -> str:
+    try:
+        return json.loads(DEVICE_FILE.read_text()).get("pairing_code", "").upper()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
 HOSTAPD_CONFIG = "/etc/hostapd/hostapd.conf"
 MAX_PAYLOAD_BYTES = 512  # generous cap for a small JSON credential blob
 # If GATT/advert registration does not produce ActiveInstances>=1 within this
@@ -279,6 +293,19 @@ class StatusCharacteristic(Characteristic):
         self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": dbus.Array(value, signature="y")}, [])
 
 
+class PairingCodeCharacteristic(Characteristic):
+    """Read-only: the device's Supabase claim code (empty until
+    divya_drishti_final.py has registered once). Same trust level as
+    StatusCharacteristic above — no separate gate, matching this file's
+    documented "private prototype only" security posture."""
+
+    def __init__(self, bus, index, service):
+        super().__init__(bus, index, PAIRING_CODE_CHRC_UUID, ["read"], service)
+
+    def ReadValue(self, options):
+        return [dbus.Byte(b) for b in _read_claim_code().encode("utf-8")]
+
+
 def _join_wifi(state: ProvisioningState, ssid: str, password: str) -> None:
     """Persist and bring up the chosen network, then report status via notify.
 
@@ -418,6 +445,7 @@ def main():
     service.add_characteristic(RxCharacteristic(bus, 0, service, state))
     service.add_characteristic(CommitCharacteristic(bus, 1, service, state))
     service.add_characteristic(StatusCharacteristic(bus, 2, service, state))
+    service.add_characteristic(PairingCodeCharacteristic(bus, 3, service))
     app.add_service(service)
 
     gatt_manager = dbus.Interface(

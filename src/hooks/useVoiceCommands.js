@@ -138,12 +138,17 @@ export function useVoiceCommands({
     try {
       await captureAndRun({ requireWake: false })
     } catch (error) {
-      setSafeStatus({
-        message: '',
-        error: error?.message || 'Could not hear you. Check microphone permission.',
-        transcript: '',
-      })
-      await speakGuidance('माइक नहीं खुल सका। फोन की अनुमति दें।', 1, { fast: true }).catch(() => {})
+      const message = error?.message || ''
+      setSafeStatus({ message: '', error: message || 'Could not hear you.', transcript: '' })
+      // Native STT rejects for many reasons ("No match", a timeout, a busy
+      // recognizer) that have nothing to do with permission -- only blame
+      // permission when the error actually says so, instead of guessing wrong.
+      const spoken = /permission/i.test(message)
+        ? 'माइक नहीं खुल सका। फोन की अनुमति दें।'
+        : /no match|timeout/i.test(message)
+          ? 'सुनाई नहीं दी। फिर से बोलिए।'
+          : 'अभी सुन नहीं पाए। फिर कोशिश करें।'
+      await speakGuidance(spoken, 1, { fast: true }).catch(() => {})
     } finally {
       listeningRef.current = false
       if (mountedRef.current) {

@@ -45,3 +45,8 @@ setup/hardware-integration/dnsmasq-divyadrishti.conf
 setup/hardware-integration/**/__pycache__/
 setup/hardware-integration/divya_drishti_final.RECONSTRUCTED.py
 setup/hardware-integration/recovered-divya_drishti_final.partial.py.txt
+setup/hardware-integration/.pi-current-backup/
+setup/hardware-integration/.pi-live-reference/
+
+# Supabase CLI local project link state (contains pooler DB connection info)
+supabase/.temp/

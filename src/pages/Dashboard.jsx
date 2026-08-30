@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AlertTriangle, BatteryMedium, Check, ChevronRight, Eye, Footprints, LoaderCircle, Mic, MicOff, Pause, Play, Radio, ScanEye, Sparkles, Type, Volume2, Waves } from 'lucide-react'
 import Layout from '../components/Layout'
 import Card from '../components/Card'
@@ -106,7 +106,7 @@ function capabilityRow(label, value, detail, tone = 'neutral') {
 }
 
 export default function Dashboard() {
-  const { status, events, loading, nearbyLink, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, obstacleHistory } = useDevice()
+  const { status, events, loading, nearbyLink, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, obstacleHistory, wakeRequestedAt } = useDevice()
   const [sensingControl, setSensingControl] = useState({ pending: null, message: '', error: '' })
   const [describeControl, setDescribeControl] = useState({
     pending: null,
@@ -252,7 +252,12 @@ export default function Dashboard() {
       const textHi = result?.text_hi?.trim() || ''
       if (!textHi) throw new Error(result?.error || 'No description returned.')
 
-      await speakGuidance(textHi)
+      // Already spoken: the Pi has no speaker of its own, so it asks this
+      // same phone to run Gemini (DeviceContext's onVisionRequest handler),
+      // which speaks the answer the moment it gets it — before this
+      // command round trip even resolves. Speaking it again here would
+      // duplicate it.
+      if (isDemoMode) await speakGuidance(textHi)
       if (!isDemoMode) {
         try {
           await sendNearbyDeviceCommand('unmute_haptics')
@@ -301,6 +306,14 @@ export default function Dashboard() {
     describePending,
     commandPending,
   })
+
+  // The Pi has no mic of its own — a single button click asks this phone to
+  // start listening, the same as tapping the listen button (wakeRequestedAt
+  // starts at 0, so the initial mount is a no-op here).
+  useEffect(() => {
+    if (wakeRequestedAt) voice.listenOnce()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wakeRequestedAt])
 
   if (loading) return <Layout title="Divya Drishti"><p className="text-mist-400 text-sm">Getting your device ready…</p></Layout>
 

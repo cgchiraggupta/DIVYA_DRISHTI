@@ -19,4 +19,7 @@ ssh pi@divyadrishti.local '
 
 Rollback: `sudo systemctl disable --now divyadrishti-control-button.service`
 
-Does not touch `divya_drishti_final.py` or the sensing unit definition.
+Does not touch the sensing unit definition. The single-tap "wake" action does
+need `divya_drishti_final.py` deployed with `"wake"` command support
+(`dispatch_companion_command`/`voice_loop`) — deploy that file too, or the
+single tap will get a 400 "Unsupported command" until it is.

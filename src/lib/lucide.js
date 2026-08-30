@@ -8,6 +8,7 @@ export { default as ChevronRight } from 'lucide-react/dist/esm/icons/chevron-rig
 export { default as Clock3 } from 'lucide-react/dist/esm/icons/clock-3.mjs'
 export { default as Eye } from 'lucide-react/dist/esm/icons/eye.mjs'
 export { default as Footprints } from 'lucide-react/dist/esm/icons/footprints.mjs'
+export { default as Headphones } from 'lucide-react/dist/esm/icons/headphones.mjs'
 export { default as HeartPulse } from 'lucide-react/dist/esm/icons/heart-pulse.mjs'
 export { default as History } from 'lucide-react/dist/esm/icons/history.mjs'
 export { default as LayoutDashboard } from 'lucide-react/dist/esm/icons/layout-dashboard.mjs'

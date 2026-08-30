@@ -41,6 +41,11 @@ public class GuardianService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Reverted 2026-08-31: adding FOREGROUND_SERVICE_TYPE_MICROPHONE here
+        // crash-looped the app on targetSdk 36 -- Android additionally requires
+        // an "eligible state" (active recording / recently foregrounded) at the
+        // exact startForeground() call, which this always-on pairing-time
+        // service never has. Background mic access needs a different approach.
         int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
             ? ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             : 0;

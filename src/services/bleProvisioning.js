@@ -6,6 +6,7 @@ const SERVICE_UUID = '5f3e0001-2a11-4b0e-9c3a-1f2e3d4c5b6a'
 const RX_CHRC_UUID = '5f3e0002-2a11-4b0e-9c3a-1f2e3d4c5b6a'
 const COMMIT_CHRC_UUID = '5f3e0003-2a11-4b0e-9c3a-1f2e3d4c5b6a'
 const STATUS_CHRC_UUID = '5f3e0004-2a11-4b0e-9c3a-1f2e3d4c5b6a'
+const PAIRING_CODE_CHRC_UUID = '5f3e0005-2a11-4b0e-9c3a-1f2e3d4c5b6a'
 
 // Conservative chunk size: fits inside the 23-byte default ATT MTU (20 usable)
 // so provisioning works before any MTU negotiation.
@@ -63,6 +64,38 @@ export async function provisionOverBle({ ssid, password, pairingCode, onStatus }
       try { await BleClient.stopNotifications(deviceId, SERVICE_UUID, STATUS_CHRC_UUID) } catch { /* ignore */ }
       try { await BleClient.disconnect(deviceId) } catch { /* ignore */ }
     }
+  }
+}
+
+/**
+ * Read the glasses' Supabase claim code directly over BLE. The Pi has no
+ * speaker, so this is how the phone learns the code instead of it being
+ * spoken aloud -- used on the Pairing screen as an alternative to typing
+ * the code in by hand.
+ *
+ * @returns {Promise<string>} the claim code, or throws if the glasses
+ *   haven't registered one yet (e.g. no internet on their first boot).
+ */
+export async function readPairingCodeOverBle() {
+  if (!isBleSupported()) {
+    throw new Error('Bluetooth setup is only available in the installed app.')
+  }
+
+  await BleClient.initialize({ androidNeverForLocation: true })
+  if (!(await BleClient.isEnabled())) {
+    await BleClient.requestEnable()
+  }
+
+  const device = await BleClient.requestDevice({ services: [SERVICE_UUID] })
+  const deviceId = device.deviceId
+  try {
+    await BleClient.connect(deviceId)
+    const value = await BleClient.read(deviceId, SERVICE_UUID, PAIRING_CODE_CHRC_UUID)
+    const code = dataViewToText(value).trim().toUpperCase()
+    if (!code) throw new Error('The glasses have not registered a pairing code yet.')
+    return code
+  } finally {
+    try { await BleClient.disconnect(deviceId) } catch { /* ignore */ }
   }
 }
 

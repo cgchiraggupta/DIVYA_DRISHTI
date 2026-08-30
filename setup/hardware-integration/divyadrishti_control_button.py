@@ -5,27 +5,24 @@ Wiring: GPIO25 (physical pin 22) to GND (physical pin 6). Internal pull-up only.
 Never drive GPIO25 toward 3.3V/5V. Separate from sensing — does not own camera,
 ToF, motors, or speaker.
 
-Actions (on release):
-  one short tap (< 1.5s)     → wait DOUBLE_TAP_WINDOW_S; if no second tap,
-                                systemctl start divyadrishti-sensing.service
-  two short taps (double-tap) → describe what's ahead via the sensing
-                                service's local API (same as the phone Describe
-                                button). A single tap never describes.
-  1.5s <= held < 3s           → dead zone (no-op, logged) — safety buffer so a
-                                slightly-long tap cannot power off
-  3s <= held <= 7s            → systemctl poweroff
-  7s < held < 8s              → dead zone (no-op, logged)
-  held >= 8s                  → systemctl reboot
+Actions (on release) — only two, nothing else:
+  one short tap (< 1.5s)      → wake: tells the phone to start listening for
+                                a voice command (the Pi has no mic of its
+                                own — the phone does the actual listening).
+                                Waits DOUBLE_TAP_WINDOW_S first in case it's
+                                actually the first half of a double-tap.
+  two short taps (double-tap) → describe what's ahead: the sensing service
+                                captures a photo and asks the phone to run
+                                Gemini on it (same as the phone's own
+                                Describe button). A single tap never describes.
+  anything else (any other hold length) → no-op.
 
-The read/describe trigger is a plain HTTP POST to the already-running sensing
-service's local API (127.0.0.1:8765/v1/command), the same endpoint the phone
-app calls. This script does not touch the camera, ToF, motors, or speaker
-itself — it only asks the sensing service to do what it already knows how to
-do. Requires: (1) divyadrishti-sensing.service is running with a local API that
-accepts {"command": "describe"} — see apply_read_near_obstacle.py /
-apply_nearby_settings.py; (2) a pairing code exists at
-/home/pi/.divyadrishti/device.json (this daemon runs as root, so it reads that
-path explicitly rather than via $HOME).
+Both triggers are a plain HTTP POST to the already-running sensing service's
+local API (127.0.0.1:8765/v1/command), the same endpoint the phone app calls.
+This script does not touch the camera, ToF, motors, mic, or speaker itself —
+it only asks the sensing service to do what it already knows how to do.
+Requires a pairing code at /home/pi/.divyadrishti/device.json (this daemon
+runs as root, so it reads that path explicitly rather than via $HOME).
 
 Deploy (when Pi is reachable; do not run from this machine blindly):
   scp setup/hardware-integration/divyadrishti_control_button.py \\
@@ -43,7 +40,6 @@ from __future__ import annotations
 import json
 import logging
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -55,9 +51,6 @@ from pathlib import Path
 GPIO_PIN = 25
 BOUNCE_TIME_S = 0.05
 TAP_MAX_SECONDS = 1.5
-SHUTDOWN_MIN_SECONDS = 3.0
-SHUTDOWN_MAX_SECONDS = 7.0
-REBOOT_MIN_SECONDS = 8.0
 # Second tap must arrive within this window after the first tap's release.
 # 0.50s was too tight on the real glasses button (two natural taps landed
 # ~0.70s apart and were logged as two single taps). 1.0s still will not
@@ -66,10 +59,9 @@ DOUBLE_TAP_WINDOW_S = 1.00
 # Ignore a second "tap" closer than this — cheap-button bounce, not a person.
 MIN_DOUBLE_TAP_GAP_S = 0.12
 LOG_PATH = Path("/var/log/divyadrishti-control-button.log")
-SENSING_UNIT = "divyadrishti-sensing.service"
 
-# Hands-free "read/describe what's ahead" trigger — calls the sensing
-# service's own local API, the same one the phone app's Describe button uses.
+# Both triggers below call the sensing service's own local API — the same
+# one the phone app's buttons use.
 LOCAL_API_URL = "http://127.0.0.1:8765/v1/command"
 LOCAL_API_TIMEOUT_S = 25.0
 DEVICE_FILE = Path("/home/pi/.divyadrishti/device.json")
@@ -112,12 +104,12 @@ def local_pairing_code() -> str:
     try:
         return json.loads(DEVICE_FILE.read_text()).get("pairing_code", "").upper()
     except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
-        logger.error("Read trigger: could not load pairing code from %s: %s", DEVICE_FILE, error)
+        logger.error("Could not load pairing code from %s: %s", DEVICE_FILE, error)
         return ""
 
 
 def cancel_pending_tap() -> None:
-    """Drop a waiting single-tap so it cannot fire start-sensing later."""
+    """Drop a waiting single-tap so it cannot fire the wake trigger later."""
     global pending_tap_timer, pending_tap_released_at
     with pending_lock:
         if pending_tap_timer is not None:
@@ -126,25 +118,22 @@ def cancel_pending_tap() -> None:
         pending_tap_released_at = None
 
 
-def fire_start_sensing() -> None:
+def fire_wake() -> None:
     global pending_tap_timer, pending_tap_released_at
     with pending_lock:
         pending_tap_timer = None
         pending_tap_released_at = None
-    logger.info(
-        "Decision: SINGLE TAP → start %s (never stop/restart)",
-        SENSING_UNIT,
-    )
-    run_systemctl("start", SENSING_UNIT)
+    logger.info("Decision: SINGLE TAP → local API /v1/command wake")
+    threading.Thread(target=_post_local_command, args=("wake", "Wake trigger"), daemon=True).start()
 
 
 def fire_describe() -> None:
     logger.info("Decision: DOUBLE TAP → local API /v1/command describe")
-    threading.Thread(target=trigger_read_command, daemon=True).start()
+    threading.Thread(target=_post_local_command, args=("describe", "Describe trigger"), daemon=True).start()
 
 
 def handle_short_tap() -> None:
-    """One tap starts sensing after a short wait; two taps in the window describe."""
+    """One tap wakes the assistant after a short wait; two taps in the window describe."""
     global pending_tap_timer, pending_tap_released_at
     now = time.monotonic()
     with pending_lock:
@@ -165,7 +154,7 @@ def handle_short_tap() -> None:
             is_double = True
         else:
             pending_tap_released_at = now
-            pending_tap_timer = threading.Timer(DOUBLE_TAP_WINDOW_S, fire_start_sensing)
+            pending_tap_timer = threading.Timer(DOUBLE_TAP_WINDOW_S, fire_wake)
             pending_tap_timer.daemon = True
             pending_tap_timer.start()
             is_double = False
@@ -174,21 +163,22 @@ def handle_short_tap() -> None:
         fire_describe()
     else:
         logger.info(
-            "Tap noted; waiting %.2fs for a second tap before starting sensing",
+            "Tap noted; waiting %.2fs for a second tap before waking",
             DOUBLE_TAP_WINDOW_S,
         )
 
 
-def trigger_read_command() -> None:
-    """Ask the sensing service to describe what's ahead — same as the phone Describe button."""
+def _post_local_command(command: str, log_prefix: str) -> None:
+    """POST {"command": ...} to the already-running sensing service's local
+    API — the same endpoint the phone app's buttons use."""
     code = local_pairing_code()
     if not code:
-        logger.error("Read trigger: no pairing code available, not calling local API")
+        logger.error("%s: no pairing code available, not calling local API", log_prefix)
         return
 
     request = urllib.request.Request(
         LOCAL_API_URL,
-        data=json.dumps({"command": "describe"}).encode("utf-8"),
+        data=json.dumps({"command": command}).encode("utf-8"),
         method="POST",
         headers={
             "Content-Type": "application/json",
@@ -204,31 +194,19 @@ def trigger_read_command() -> None:
             except json.JSONDecodeError:
                 pass
             logger.info(
-                "Read trigger: local API responded %s status=%s",
+                "%s: local API responded %s status=%s",
+                log_prefix,
                 response.status,
                 status or "unknown",
             )
             if status in ("busy", "cooldown"):
                 logger.warning(
-                "Read trigger: describe not spoken (%s) — Gemini slot was busy or on cooldown",
+                    "%s: not spoken (%s) — Gemini slot was busy or on cooldown",
+                    log_prefix,
                     status,
                 )
     except urllib.error.URLError as error:
-        logger.error("Read trigger: local API call failed (%s): %s", LOCAL_API_URL, error)
-
-
-def run_systemctl(*args: str) -> None:
-    """Run systemctl directly; this service runs as root."""
-    command = ["systemctl", *args]
-    logger.info("Running: %s", " ".join(command))
-    try:
-        subprocess.run(command, check=True)
-    except subprocess.CalledProcessError as error:
-        logger.exception(
-            "Command failed with exit code %s: %s",
-            error.returncode,
-            " ".join(command),
-        )
+        logger.error("%s: local API call failed (%s): %s", log_prefix, LOCAL_API_URL, error)
 
 
 def on_pressed() -> None:
@@ -253,33 +231,12 @@ def on_released() -> None:
 
     if held_seconds < TAP_MAX_SECONDS:
         handle_short_tap()
-    elif SHUTDOWN_MIN_SECONDS <= held_seconds <= SHUTDOWN_MAX_SECONDS:
-        cancel_pending_tap()
-        logger.warning(
-            "Decision: SHUTDOWN (%.1fs–%.1fs hold, got %.2fs) → systemctl poweroff",
-            SHUTDOWN_MIN_SECONDS,
-            SHUTDOWN_MAX_SECONDS,
-            held_seconds,
-        )
-        run_systemctl("poweroff")
-    elif held_seconds >= REBOOT_MIN_SECONDS:
-        cancel_pending_tap()
-        logger.warning(
-            "Decision: REBOOT (%.1fs+ hold, got %.2fs) → systemctl reboot",
-            REBOOT_MIN_SECONDS,
-            held_seconds,
-        )
-        run_systemctl("reboot")
     else:
         cancel_pending_tap()
         logger.info(
-            "Decision: NO-OP dead zone (%.2fs); bands are <%.1fs tap "
-            "(double-tap = describe), %.1f–%.1fs shutdown, %.1fs+ reboot",
+            "Decision: NO-OP (held %.2fs >= %.1fs tap window); only short taps do anything",
             held_seconds,
             TAP_MAX_SECONDS,
-            SHUTDOWN_MIN_SECONDS,
-            SHUTDOWN_MAX_SECONDS,
-            REBOOT_MIN_SECONDS,
         )
 
 

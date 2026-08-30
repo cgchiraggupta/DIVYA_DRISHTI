@@ -370,7 +370,13 @@ export function DeviceProvider({ children }) {
       disconnectLocalSocket()
       stopBackgroundGuardian()
     }
-  }, [device, speakAlertOnce])
+    // Depend on the pairing code, not the device object -- loadDevice's 15s
+    // background poll returns a fresh object every time even when nothing
+    // changed, which was tearing down and rebuilding this whole socket +
+    // GuardianService link every 15s. Harmless in the foreground (each
+    // restart gets re-allowed), but the moment the app backgrounds, Android
+    // denies the next restart outright and the link never comes back.
+  }, [device?.pairing_code, speakAlertOnce])
 
   const pairDevice = async (pairingCode) => {
     if (isDemoMode) {

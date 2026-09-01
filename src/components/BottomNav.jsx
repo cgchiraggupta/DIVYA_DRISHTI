@@ -1,9 +1,10 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, History, SlidersHorizontal, Stethoscope } from 'lucide-react'
+import { LayoutDashboard, History, Navigation2, SlidersHorizontal, Stethoscope } from '../lib/lucide'
 import { tapFeedback } from '../services/sensoryFeedback'
 
 const items = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
+  { to: '/navigate', label: 'Navigate', icon: Navigation2 },
   { to: '/history', label: 'History', icon: History },
   { to: '/settings', label: 'Settings', icon: SlidersHorizontal },
   { to: '/diagnostics', label: 'Diagnostics', icon: Stethoscope },
@@ -16,7 +17,7 @@ export default function BottomNav() {
                  pb-[env(safe-area-inset-bottom)]"
       aria-label="Primary"
     >
-      <ul className="grid grid-cols-4">
+      <ul className="grid grid-cols-5">
         {items.map(({ to, label, icon: Icon, end }) => (
           <li key={to}>
             <NavLink

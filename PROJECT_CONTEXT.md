@@ -133,10 +133,36 @@ src/
     sarvamTts.js               Sarvam text-to-speech integration
     sensoryFeedback.js         Haptic/audio alert dispatch on the phone
     obstacleHistory.js         Client-side obstacle event/history handling
+  navigation/                 "Navigate" feature (voice/typed destination -> turn-by-turn),
+                               isolated MVC module, independent of the Pi/hardware side:
+    models/                    Plain data shapes: Destination, RouteStep/Route, NavState
+    services/                  destinationExtractor.js (Gemini via gemini-navigate edge fn),
+                               geocodingService.js + routingService.js (OpenRouteService),
+                               gpsTrackerService.js (Capacitor Geolocation), navigationSpeech.js
+                               (wraps existing sarvamTts.js)
+    controllers/               NavigationController.js — framework-agnostic orchestration
+                               (extract -> geocode -> route -> GPS-driven step advance -> speak)
+    hooks/                     useNavigation.js — React adapter over the controller
+    pages/                     Navigate.jsx — screen, routed at /navigate
 
 supabase/
   schema.sql                  Full table definitions, RLS policies, RPCs, Realtime publication
   migrations/                 Ordered schema migrations (see README for apply order)
+  functions/gemini-navigate/  Edge function: text -> destination place name via Gemini
+                               (same pairing-code-gated pattern as functions/gemini-vision),
+                               with a 10-turn nav-session history for "actually go to X instead"
+  functions/divya-chat/       10-turn conversation history (bumped from 8; 2026-09-01) --
+                               redeploy after pulling this change
+
+Voice conversation barge-in (2026-09-01): src/services/bargeIn.js lets the user interrupt Divya
+mid-sentence by just talking, instead of waiting for her to finish -- runs a continuous
+partial-results listen session in parallel with TTS via
+@capgo/capacitor-speech-recognition's continuousPTT/partialResults, native-only. Falls back to
+tap-to-interrupt everywhere else (the Listen button becomes "Tap to interrupt" while Divya is
+speaking -- see useVoiceCommands.js's `speaking` state and Dashboard.jsx). Wired into both the
+free-form Divya conversation (useVoiceCommands.js) and turn-by-turn Navigate announcements
+(navigation/services/navigationSpeech.js) so interrupting either hands the user's words straight
+back in as the next turn, no extra listen round trip.
 
 setup/hardware-integration/
   divya_drishti_final.py      (lives on the Pi, not in this repo verbatim) main sensing/alerts loop
@@ -240,9 +266,13 @@ are allowed to stay blocked pending Gemini API billing, per a deliberate formal 
 a third-party billing delay block the whole project (see decisions doc).
 
 **Explicitly out of scope right now** (do not start building these until Phase 1 formally exits):
-wake word ("Hey Divya Drishti"), color ID/object memory, GPS/maps/routing, continuous
-always-on Gemini (deliberately rejected, not just "not done yet"), miniaturization/custom
-PCB/casing/manufacturing, push notifications.
+wake word ("Hey Divya Drishti"), color ID/object memory, continuous always-on Gemini
+(deliberately rejected, not just "not done yet"), miniaturization/custom PCB/casing/manufacturing,
+push notifications.
+
+**GPS/maps/routing** was originally on this out-of-scope list but was deliberately pulled forward
+and started (2026-09-01) as a phone-only "Navigate" feature — see `src/navigation/` below. It does
+not touch the Pi/hardware side or Phase 1 exit criteria.
 
 ---
 

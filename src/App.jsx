@@ -1,5 +1,6 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate as RouterNavigate } from 'react-router-dom'
 import { DeviceProvider, useDevice } from './context/DeviceContext'
+import { NavigationSessionProvider } from './navigation/context/NavigationSessionContext'
 import { isDemoMode, isSupabaseConfigured } from './lib/supabaseClient'
 import Pairing from './pages/Pairing'
 import Dashboard from './pages/Dashboard'
@@ -7,11 +8,12 @@ import History from './pages/History'
 import Settings from './pages/Settings'
 import Diagnostics from './pages/Diagnostics'
 import WifiSetup from './pages/WifiSetup'
+import NavigatePage from './navigation/pages/Navigate'
 
 function RequireDevice({ children }) {
   const { device, loading } = useDevice()
   if (loading) return <FullScreenLoader />
-  if (!device) return <Navigate to="/pairing" replace />
+  if (!device) return <RouterNavigate to="/pairing" replace />
   return children
 }
 
@@ -60,7 +62,15 @@ function AppRoutes() {
           </RequireDevice>
         }
       />
-      <Route path="*" element={<Navigate to="/" replace />} />
+      <Route
+        path="/navigate"
+        element={
+          <RequireDevice>
+            <NavigatePage />
+          </RequireDevice>
+        }
+      />
+      <Route path="*" element={<RouterNavigate to="/" replace />} />
     </Routes>
   )
 }
@@ -73,7 +83,9 @@ export default function App() {
   return (
     <BrowserRouter>
       <DeviceProvider>
-        <AppRoutes />
+        <NavigationSessionProvider>
+          <AppRoutes />
+        </NavigationSessionProvider>
       </DeviceProvider>
     </BrowserRouter>
   )

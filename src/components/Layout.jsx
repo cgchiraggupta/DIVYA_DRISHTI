@@ -1,4 +1,5 @@
 import BottomNav from './BottomNav'
+import FloatingWakeButton from './FloatingWakeButton'
 
 export default function Layout({ title, subtitle, action, children }) {
   return (
@@ -13,6 +14,7 @@ export default function Layout({ title, subtitle, action, children }) {
 
       <main className="flex-1 px-5 pb-28">{children}</main>
 
+      <FloatingWakeButton />
       <BottomNav />
     </div>
   )

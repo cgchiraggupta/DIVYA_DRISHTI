@@ -7,6 +7,8 @@ import { connectLocalSocket, disconnectLocalSocket, isLocalSocketConnected, send
 import { describeForGlasses } from '../services/glassesVision'
 import { loadObstacleHistory, saveObstacleHistoryItem } from '../services/obstacleHistory'
 import { startBackgroundGuardian, stopBackgroundGuardian } from '../services/backgroundGuardian'
+import { startWakeListener, stopWakeListener } from '../services/wakeListener'
+import { isNavigatingActive } from '../navigation/navActiveFlag'
 
 const DeviceContext = createContext(undefined)
 const PAIRING_CODE_KEY = 'divya-drishti-pairing-code'
@@ -232,6 +234,11 @@ export function DeviceProvider({ children }) {
     let active = true
     // Hold the CPU and Wi-Fi awake for as long as this device stays paired.
     startBackgroundGuardian()
+    // Lets the glasses button wake the mic even with the app closed and the
+    // phone locked -- press the button, no need to open the phone at all.
+    // Permission is requested separately (Dashboard's wake-listener toggle);
+    // this call is a no-op on native if RECORD_AUDIO was never granted.
+    startWakeListener(nearbyPairingCode)
 
     const handlePhoneAlert = async (alert) => {
       if (!alert?.alert_id) return
@@ -288,9 +295,16 @@ export function DeviceProvider({ children }) {
       // Glasses speaker is unreliable — guide on the phone when the app is open.
       // Speak new obstacles + Read/Gemini; skip silent live photo refreshes (tof_live).
       const isLiveRefresh = alert.source === 'tof_live'
+      // Passive/ambient narration only -- the glasses' own beep+vibration
+      // still fires regardless (that's motor hardware on the Pi, independent
+      // of this phone) -- explicit taps (plain describe/read) still speak
+      // even mid-route, since the user asked for those on purpose.
+      const isAmbientObstacleNarration =
+        alert.speak === true || alert.source === 'tof_snapshot' || alert.kind === 'obstacle' || isAutoDescribe
       const shouldSpeak =
         Boolean(speakText)
         && !isLiveRefresh
+        && !(isAmbientObstacleNarration && isNavigatingActive())
         && (
           isDescribe
           || alert.speak === true
@@ -369,6 +383,7 @@ export function DeviceProvider({ children }) {
       active = false
       disconnectLocalSocket()
       stopBackgroundGuardian()
+      stopWakeListener()
     }
     // Depend on the pairing code, not the device object -- loadDevice's 15s
     // background poll returns a fresh object every time even when nothing
@@ -395,6 +410,12 @@ export function DeviceProvider({ children }) {
     await loadDevice()
     return data
   }
+
+  /** Fires the same effect a real "wake" command produces (see
+   * onWakeRequested above) without a Pi round trip -- used by the in-app
+   * floating wake button as its demo-mode/offline fallback so it still
+   * responds instantly when the nearby link isn't connected. */
+  const triggerWakeLocally = () => setWakeRequestedAt(Date.now())
 
   const sendNearbyDeviceCommand = async (command) => {
     if (!device?.pairing_code) throw new Error('Pair your glasses before sending a nearby command.')
@@ -437,6 +458,7 @@ export function DeviceProvider({ children }) {
   const value = {
     device, status, events, loading, nearbyLink, dataError, lastRefreshedAt, obstacleHistory, wakeRequestedAt,
     pairDevice, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, refresh: loadDevice,
+    triggerWakeLocally,
   }
 
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>

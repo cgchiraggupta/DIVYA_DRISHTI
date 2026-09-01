@@ -1,14 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { useNavigate as useRouterNavigate } from 'react-router-dom'
 import { AlertTriangle, BatteryMedium, Check, ChevronRight, Eye, Footprints, LoaderCircle, Mic, MicOff, Pause, Play, Radio, ScanEye, Sparkles, Type, Volume2, Waves } from 'lucide-react'
 import Layout from '../components/Layout'
 import Card from '../components/Card'
 import StatusPulse from '../components/StatusPulse'
 import { useDevice } from '../context/DeviceContext'
+import { useNavigationSession } from '../navigation/context/NavigationSessionContext'
 import { previewScenes } from '../lib/demoData'
 import { alertLabel, formatDistanceMeters, isHazardEvent, timeAgo } from '../lib/format'
 import { isDemoMode } from '../lib/supabaseClient'
 import { useVoiceCommands } from '../hooks/useVoiceCommands'
 import { signalGuidance, speakGuidance } from '../services/sensoryFeedback'
+import { Zap } from '../lib/lucide'
+import {
+  checkWakeListenerPermissions,
+  isWakeListenerRunning,
+  requestWakeListenerPermissions,
+  startWakeListener,
+} from '../services/wakeListener'
 
 const GEMINI_UNAVAILABLE_KEY = 'divyadrishti-gemini-unavailable'
 
@@ -107,6 +116,7 @@ function capabilityRow(label, value, detail, tone = 'neutral') {
 
 export default function Dashboard() {
   const { device, status, events, loading, nearbyLink, playPreviewScene, sendNearbyDeviceCommand, describeNearbySurroundings, obstacleHistory, wakeRequestedAt } = useDevice()
+  const routerNavigate = useRouterNavigate()
   const [sensingControl, setSensingControl] = useState({ pending: null, message: '', error: '' })
   const [describeControl, setDescribeControl] = useState({
     pending: null,
@@ -123,6 +133,36 @@ export default function Dashboard() {
       return false
     }
   })
+  const [wakeListener, setWakeListener] = useState({ granted: false, running: false, busy: false })
+
+  useEffect(() => {
+    let active = true
+    checkWakeListenerPermissions().then((perms) => {
+      if (!active) return
+      const granted = Boolean(perms?.mic && perms?.notifications)
+      setWakeListener((prev) => ({ ...prev, granted }))
+      if (!granted) return
+      isWakeListenerRunning().then((running) => {
+        if (active) setWakeListener((prev) => ({ ...prev, running }))
+      })
+    })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const enableWakeListener = async () => {
+    setWakeListener((prev) => ({ ...prev, busy: true }))
+    const perms = await requestWakeListenerPermissions()
+    const granted = Boolean(perms?.mic && perms?.notifications)
+    if (!granted) {
+      setWakeListener({ granted: false, running: false, busy: false })
+      return
+    }
+    const running = device?.pairing_code ? await startWakeListener(device.pairing_code) : false
+    setWakeListener({ granted: true, running, busy: false })
+  }
+
   const state = safetyState(status)
   const sensingPaused = nearbyLink.status?.paused === true
   const displayState = sensingPaused ? 'paused' : state
@@ -300,6 +340,9 @@ export default function Dashboard() {
 
   const pairingCode = isDemoMode ? import.meta.env.VITE_LOCAL_PAIRING_CODE : device?.pairing_code
 
+  const { navigateTo: navigateToDestination } = useNavigationSession()
+  const goToNavigateScreen = useCallback(() => routerNavigate('/navigate'), [routerNavigate])
+
   const voice = useVoiceCommands({
     runVision,
     sendNearbyDeviceCommand,
@@ -308,6 +351,8 @@ export default function Dashboard() {
     describePending,
     commandPending,
     pairingCode,
+    navigateTo: navigateToDestination,
+    goToNavigateScreen,
   })
 
   // The Pi has no mic of its own — a single button click asks this phone to
@@ -395,12 +440,14 @@ export default function Dashboard() {
           <button
             type="button"
             onClick={voice.listenOnce}
-            disabled={voice.listening || voice.busy || !!describePending}
+            disabled={(voice.busy && !voice.speaking) || !!describePending}
             className={`mt-4 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50 ${voice.listening ? 'bg-alert-500 text-night-950' : 'bg-signal-500 text-night-950'}`}
           >
             {voice.listening
               ? <><LoaderCircle className="animate-spin" size={17} /> Listening…</>
-              : <><Mic size={17} /> Listen</>}
+              : voice.speaking
+                ? <><Mic size={17} /> Tap to interrupt</>
+                : <><Mic size={17} /> Listen</>}
           </button>
           <button
             type="button"
@@ -418,6 +465,41 @@ export default function Dashboard() {
           </p>
           {voice.status.transcript && (
             <p className="mt-2 text-xs leading-5 text-mist-400">Heard: {voice.status.transcript}</p>
+          )}
+        </Card>
+
+        <Card
+          title="Background wake"
+          eyebrow="Glasses button · works with the app closed"
+          action={wakeListener.granted && wakeListener.running && (
+            <span className="flex items-center gap-1.5 rounded-full bg-alert-500/15 px-2.5 py-1 text-xs font-semibold text-alert-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-alert-400 animate-pulse" />
+              Ready
+            </span>
+          )}
+        >
+          <p className="text-sm leading-6 text-mist-400">
+            Press the button on your glasses to start talking — no need to unlock or open the phone.
+            The mic opens for up to 5 seconds of silence, then closes on its own.
+          </p>
+          {!wakeListener.granted ? (
+            <button
+              type="button"
+              onClick={enableWakeListener}
+              disabled={wakeListener.busy}
+              className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold
+                         bg-signal-500 text-night-950 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {wakeListener.busy
+                ? <><LoaderCircle className="animate-spin" size={17} /> Requesting…</>
+                : <><Zap size={17} /> Turn on background wake</>}
+            </button>
+          ) : (
+            <p className="mt-4 text-xs leading-5 text-mist-500">
+              {wakeListener.running
+                ? 'On — a notification stays visible while this is active, as required by Android.'
+                : 'Permission granted, but the listener is not running yet — reopen this screen once connected to the glasses’ Wi-Fi.'}
+            </p>
           )}
         </Card>
 

@@ -4,10 +4,14 @@ import { getLastSpokenText, speakGuidance, stopSpeech, tapFeedback } from '../se
 import { listenForSpeech, playListenCue, stopListening } from '../services/phoneSpeech'
 import { helpSpeech, pickVoiceIntent } from '../services/voiceIntents'
 import { askDivya } from '../services/divyaChat'
+import { speakWithBargeIn } from '../services/bargeIn'
+import { extractDestination } from '../navigation/services/destinationExtractor'
 
 const WAIT_SPEAK = 'थोड़ा रुकिए, अभी एक काम चल रहा है।'
 const NO_DISTANCE_SPEAK = 'अभी दूरी नहीं मिली। थोड़ा चलिए, फिर पूछिए कितनी दूर।'
-const MAX_CHAT_HISTORY_TURNS = 8
+// Matches divya-chat's MAX_HISTORY_TURNS — keep the client-side cap in sync
+// with what the server actually keeps.
+const MAX_CHAT_HISTORY_TURNS = 10
 
 export function useVoiceCommands({
   runVision,
@@ -17,10 +21,20 @@ export function useVoiceCommands({
   describePending,
   commandPending,
   pairingCode,
+  // Shared NavigationController's navigateTo + a screen switch, so a spoken
+  // "take me to X" from anywhere (button wake included) actually starts a
+  // route instead of falling through to a generic Divya-chat reply that
+  // doesn't know navigation exists -- see NavigationSessionContext.
+  navigateTo,
+  goToNavigateScreen,
 }) {
   const [listening, setListening] = useState(false)
   const [handsFree, setHandsFree] = useState(false)
   const [busy, setBusy] = useState(false)
+  // True only while a Divya reply is actively playing (not during capture or
+  // thinking) -- lets the UI offer tap-to-interrupt instead of a disabled
+  // button for that window.
+  const [speaking, setSpeaking] = useState(false)
   const [status, setStatus] = useState({ message: '', error: '', transcript: '' })
 
   const handsFreeRef = useRef(false)
@@ -118,6 +132,22 @@ export function useVoiceCommands({
           await speakGuidance('कुछ सुनाई नहीं दिया।', 1, { fast: true })
           return { ok: false }
         }
+
+        // Check navigation before Divya-chat -- a blind user speaks a
+        // destination directly ("India Gate le chalo"), never opens a
+        // screen or types anything. gemini-navigate returns 'not_found' for
+        // anything that isn't an actual travel request, so this safely
+        // falls through to the normal conversation below for everything
+        // else -- one Gemini call either way, no separate classifier needed.
+        if (navigateTo) {
+          const navCheck = await extractDestination(pairingCode, question)
+          if (navCheck.status === 'ok' && navCheck.destination) {
+            goToNavigateScreen?.()
+            navigateTo(question, navCheck)
+            return { ok: true }
+          }
+        }
+
         const result = await askDivya(pairingCode, question, chatHistoryRef.current)
         if (result.ok) {
           chatHistoryRef.current = [
@@ -126,16 +156,29 @@ export function useVoiceCommands({
             { role: 'model', text: result.reply },
           ].slice(-MAX_CHAT_HISTORY_TURNS * 2)
         }
-        await speakGuidance(result.reply, 1, { fast: true })
+        // Barge-in: if the user starts talking while the reply is still
+        // playing, cut it off immediately and treat what they said as the
+        // next turn -- no need to wait for the reply to finish or re-open
+        // the mic separately. `speaking` also drives tap-to-interrupt on
+        // platforms where continuous listening isn't available.
+        if (mountedRef.current) setSpeaking(true)
+        const spoken = await speakWithBargeIn(() => speakGuidance(result.reply, 1, { fast: true }))
+        if (mountedRef.current) setSpeaking(false)
+        if (spoken.interrupted) {
+          return { ok: result.ok, listenAgain: false, requireWake: false, interruptedWith: spoken.matches }
+        }
         return { ok: result.ok, listenAgain: result.ok, requireWake: false }
       }
     }
-  }, [commandPending, describePending, getDistanceMm, nearbyControlAvailable, runVision, sendNearbyDeviceCommand])
+  }, [commandPending, describePending, getDistanceMm, goToNavigateScreen, navigateTo, nearbyControlAvailable, runVision, sendNearbyDeviceCommand])
 
-  const captureAndRun = useCallback(async ({ requireWake } = {}) => {
-    await stopSpeech()
-    await playListenCue()
-    const matches = await listenForSpeech()
+  const captureAndRun = useCallback(async ({ requireWake, prefetchedMatches } = {}) => {
+    let matches = prefetchedMatches
+    if (!matches) {
+      await stopSpeech()
+      await playListenCue()
+      matches = await listenForSpeech()
+    }
     const mapped = pickVoiceIntent(matches, { requireWake })
     setSafeStatus({
       message: mapped.intent === 'ignored' ? 'Waiting for Hey Divya.' : '',
@@ -147,6 +190,11 @@ export function useVoiceCommands({
       return mapped
     }
     const result = await executeIntent(mapped)
+    // Interrupted mid-reply: the user's own words are already in hand, so
+    // go straight to that turn instead of stopping to listen again.
+    if (result?.interruptedWith) {
+      return captureAndRun({ requireWake: false, prefetchedMatches: result.interruptedWith })
+    }
     if (result?.listenAgain) {
       return captureAndRun({ requireWake: false })
     }
@@ -154,13 +202,23 @@ export function useVoiceCommands({
   }, [executeIntent, setSafeStatus])
 
   const listenOnce = useCallback(async () => {
-    if (listeningRef.current || busy) return
+    // Tap-to-interrupt: while Divya is only speaking (not actively
+    // capturing), tapping Listen stops her immediately and starts a fresh
+    // capture, instead of being disabled until she finishes. Still refuses
+    // to double-start over an in-progress capture.
+    if (listeningRef.current) return
+    if (busy && !speaking) return
+    const wasInterrupt = speaking
+    if (wasInterrupt) await stopSpeech()
     listeningRef.current = true
     setListening(true)
     setBusy(true)
+    setSpeaking(false)
     setSafeStatus({ message: 'Listening…', error: '', transcript: '' })
     tapFeedback()
-    chatHistoryRef.current = []
+    // A fresh top-level tap starts a clean conversation; interrupting an
+    // in-progress reply keeps history so the exchange stays coherent.
+    if (!wasInterrupt) chatHistoryRef.current = []
     try {
       await captureAndRun({ requireWake: false })
     } catch (error) {
@@ -183,7 +241,7 @@ export function useVoiceCommands({
         setStatus((prev) => (prev.message === 'Listening…' ? { ...prev, message: '' } : prev))
       }
     }
-  }, [busy, captureAndRun, setSafeStatus])
+  }, [busy, speaking, captureAndRun, setSafeStatus])
 
   const runHandsFreeLoop = useCallback(async (token) => {
     while (mountedRef.current && handsFreeRef.current && loopRef.current === token) {
@@ -228,6 +286,7 @@ export function useVoiceCommands({
     listening,
     handsFree,
     busy,
+    speaking,
     status,
     listenOnce,
     toggleHandsFree,

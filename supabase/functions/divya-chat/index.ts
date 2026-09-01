@@ -13,7 +13,9 @@ const CORS_HEADERS = {
 }
 
 const GEMINI_MODEL = 'gemini-3.5-flash'
-const MAX_HISTORY_TURNS = 8
+// Last 10 user+model turns, so replies stay coherent across a longer
+// back-and-forth without growing the prompt unboundedly.
+const MAX_HISTORY_TURNS = 10
 
 const SYSTEM_INSTRUCTION =
   'You are Divya, the voice companion built into Divya Drishti smart glasses for a ' +
@@ -28,6 +30,13 @@ const SYSTEM_INSTRUCTION =
   'instead, which does use the camera. Never claim to see anything here. ' +
   'You are not responsible for obstacle safety alerts -- those come from the glasses\' ' +
   'own sensors independently of this conversation; do not comment on them unless asked. ' +
+  'The app has a walking-navigation feature -- simply saying a destination out loud ' +
+  '("take me to India Gate", "Connaught Place le chalo") already starts it, before this ' +
+  'conversation even runs; you only see a message here if that did NOT count as a ' +
+  'navigation request. So if the user is clearly trying to go somewhere and you are ' +
+  'seeing this, ask them to say it more directly as "take me to <place>" rather than ' +
+  'sounding confused or claiming you cannot help with navigation -- never say the app ' +
+  'cannot navigate, since it can. ' +
   'Be warm, direct, and genuinely useful -- this is a real assistant conversation, not a ' +
   'canned script.'
 

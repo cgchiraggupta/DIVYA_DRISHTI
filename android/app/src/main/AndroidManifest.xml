@@ -30,6 +30,21 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <!-- Always-on (no mic) listener for the glasses button's wake
+             command: works with the app closed and the phone locked. -->
+        <service
+            android:name=".WakeListenerService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- Promotes to a microphone-type foreground service only for the
+             duration of one wake-triggered voice turn: see
+             VoiceCaptureService for why it cannot be always-on. -->
+        <service
+            android:name=".VoiceCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -50,6 +65,10 @@
          and Wi-Fi locks keep the obstacle poll and spoken alerts running. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- VoiceCaptureService: background wake-and-listen (glasses button ->
+         mic opens without opening the app), promoted only while actually
+         recording: see VoiceCaptureService for the eligible-state rule. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
@@ -69,9 +88,11 @@
     <uses-permission
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
-    <uses-permission
-        android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+
+    <!-- Turn-by-turn GPS navigation (Navigate tab). Unscoped (all SDK
+         versions), unlike the legacy BLE-only fine-location grant above. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <uses-feature
         android:name="android.hardware.bluetooth_le"
